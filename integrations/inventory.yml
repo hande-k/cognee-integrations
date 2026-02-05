@@ -12,7 +12,7 @@ integrations:
     registry: npm
     package_name: "@openclaw/memory-cognee"
     cognee_dependency: http-api
-    current_version: "2026.2.3"
+    current_version: "2026.2.4"
     notes: "OpenClaw plugin with auto-recall/capture hooks"
 
 # ── Future migrations (not yet in monorepo) ─────────────────────────
