@@ -1,11 +1,12 @@
-# cognee-integration-openclaw
+# @openclaw/memory-cognee
 
-OpenClaw plugin that adds Cognee-backed memory with automatic recall and capture.
+OpenClaw plugin that adds Cognee-backed memory with automatic recall and indexing.
 
 ## Features
 
 - **Auto-recall**: Before each agent run, searches Cognee for relevant memories and injects them as context
-- **Auto-capture**: After each agent run, stores conversation transcripts in Cognee for future recall
+- **Auto-index**: On startup and after each agent run, syncs memory markdown files to Cognee (add new, update changed, skip unchanged)
+- **CLI commands**: `openclaw cognee index` to manually sync, `openclaw cognee status` to check state
 - **Configurable**: Search type, max results, score filtering, token limits, and more
 
 ## Installation
@@ -41,7 +42,7 @@ plugins:
         searchType: "GRAPH_COMPLETION"
         maxResults: 6
         autoRecall: true
-        autoCapture: true
+        autoIndex: true
 ```
 
 Set your API key in the environment:
@@ -62,16 +63,30 @@ export COGNEE_API_KEY="your-key-here"
 | `minScore` | number | `0` | Minimum relevance score filter |
 | `maxTokens` | number | `512` | Token cap for recall context |
 | `autoRecall` | boolean | `true` | Inject memories before agent runs |
-| `autoCapture` | boolean | `true` | Store transcripts after agent runs |
+| `autoIndex` | boolean | `true` | Sync memory files on startup and after agent runs |
 | `autoCognify` | boolean | `true` | Run cognify after new memories are added |
-| `updateExisting` | boolean | `true` | Update existing memory entries when possible |
 | `requestTimeoutMs` | number | `60000` | HTTP timeout for Cognee requests |
 
 ## How It Works
 
-1. **Before agent start**: Plugin searches Cognee for memories relevant to the user's prompt and prepends them as a `<cognee_memories>` context block
-2. **After agent end**: Plugin extracts the conversation transcript and stores it in Cognee, building up the memory over time
-3. **Dataset state**: Tracks dataset IDs locally at `~/.openclaw/memory/cognee/datasets.json`
+1. **On startup**: Scans `memory/` directory for markdown files and syncs to Cognee (add new, update changed, skip unchanged)
+2. **Before agent start**: Searches Cognee for memories relevant to the prompt and prepends as `<cognee_memories>` context
+3. **After agent end**: Re-scans memory files and syncs any changes the agent made
+4. **State tracking**:
+   - `~/.openclaw/memory/cognee/datasets.json` — dataset ID mapping
+   - `~/.openclaw/memory/cognee/sync-index.json` — per-file hash and Cognee data IDs
+
+Memory files detected at: `MEMORY.md`, `memory.md`, or `memory/*.md`
+
+## CLI Commands
+
+```bash
+# Manually sync memory files to Cognee
+openclaw cognee index
+
+# Check sync status (indexed files, pending changes)
+openclaw cognee status
+```
 
 ## Development
 
