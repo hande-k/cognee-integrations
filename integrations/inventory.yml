@@ -1,0 +1,24 @@
+# Cognee Integrations Inventory
+#
+# Tracks all integrations in this monorepo.
+# Update this file when adding new integrations.
+
+integrations:
+
+  - slug: openclaw
+    name: "Memory (Cognee) for OpenClaw"
+    owner: cognee
+    language: typescript
+    registry: npm
+    package_name: "@openclaw/memory-cognee"
+    cognee_dependency: http-api
+    current_version: "2026.2.3"
+    notes: "OpenClaw plugin with auto-recall/capture hooks"
+
+# ── Future migrations (not yet in monorepo) ─────────────────────────
+#
+# These integrations exist in external repos and may be migrated later:
+# - langgraph: https://github.com/topoteretes/cognee-integration-langgraph
+# - openai-agents: https://github.com/topoteretes/cognee-integration-openai-agents
+#
+# Add entries above when migrations are complete.

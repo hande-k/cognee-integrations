@@ -1,0 +1,26 @@
+name: Check Version Pinning
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'integrations/*/pyproject.toml'
+  push:
+    branches: [main]
+    paths:
+      - 'integrations/*/pyproject.toml'
+
+jobs:
+  check-pins:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
+
+      - name: Check cognee version pinning
+        run: python scripts/check_version_pins.py

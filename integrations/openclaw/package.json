@@ -1,0 +1,35 @@
+{
+  "name": "@openclaw/memory-cognee",
+  "version": "2026.2.3",
+  "type": "module",
+  "description": "OpenClaw Cognee-backed memory plugin with auto-recall/capture",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "files": [
+    "dist",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.2.3-1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "openclaw": "2026.2.3-1",
+    "typescript": "^5.3.0"
+  },
+  "overrides": {
+    "tar": "7.5.7"
+  }
+}

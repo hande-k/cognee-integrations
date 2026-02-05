@@ -1,0 +1,121 @@
+name: Integration Tests
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'integrations/**'
+      - '.github/workflows/ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'integrations/**'
+      - '.github/workflows/ci.yml'
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      python: ${{ steps.classify.outputs.python }}
+      typescript: ${{ steps.classify.outputs.typescript }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect and classify changed integrations
+        id: classify
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=${{ github.event.pull_request.base.sha }}
+          else
+            BASE=${{ github.event.before }}
+          fi
+
+          # Find changed integration directories (exclude dotfiles like inventory.yml edits)
+          CHANGED_DIRS=$(git diff --name-only "$BASE" HEAD -- integrations/ \
+            | grep -E '^integrations/[^/]+/' \
+            | cut -d/ -f2 | sort -u || true)
+
+          PY_LIST=""
+          TS_LIST=""
+
+          for dir in $CHANGED_DIRS; do
+            [ ! -d "integrations/$dir" ] && continue
+            if [ -f "integrations/$dir/pyproject.toml" ]; then
+              PY_LIST="${PY_LIST}\"${dir}\","
+            elif [ -f "integrations/$dir/package.json" ]; then
+              TS_LIST="${TS_LIST}\"${dir}\","
+            fi
+          done
+
+          # Build JSON arrays
+          if [ -n "$PY_LIST" ]; then
+            echo "python=[${PY_LIST%,}]" >> "$GITHUB_OUTPUT"
+          else
+            echo "python=[]" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ -n "$TS_LIST" ]; then
+            echo "typescript=[${TS_LIST%,}]" >> "$GITHUB_OUTPUT"
+          else
+            echo "typescript=[]" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Changed dirs: $CHANGED_DIRS"
+
+  test-python:
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.python != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        integration: ${{ fromJSON(needs.detect-changes.outputs.python) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        working-directory: integrations/${{ matrix.integration }}
+        run: uv sync --locked --dev
+
+      - name: Run tests
+        working-directory: integrations/${{ matrix.integration }}
+        run: uv run pytest tests/ -v
+
+  test-typescript:
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.typescript != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        integration: ${{ fromJSON(needs.detect-changes.outputs.typescript) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        working-directory: integrations/${{ matrix.integration }}
+        run: npm install
+
+      - name: Type check
+        working-directory: integrations/${{ matrix.integration }}
+        run: npx tsc --noEmit --skipLibCheck
