@@ -10,7 +10,7 @@ integrations:
     owner: cognee
     language: typescript
     registry: npm
-    package_name: "@openclaw/memory-cognee"
+    package_name: "@cognee/cognee-openclaw"
     cognee_dependency: http-api
     current_version: "2026.2.4"
     notes: "OpenClaw plugin with auto-recall/capture hooks"

@@ -1,4 +1,4 @@
-# @openclaw/memory-cognee
+# @cognee/cognee-openclaw
 
 OpenClaw plugin that adds Cognee-backed memory with automatic recall and indexing.
 
@@ -23,7 +23,7 @@ openclaw plugins install -l .
 Or once published:
 
 ```bash
-openclaw plugins install @openclaw/memory-cognee
+openclaw plugins install @cognee/cognee-openclaw
 ```
 
 ## Configuration
