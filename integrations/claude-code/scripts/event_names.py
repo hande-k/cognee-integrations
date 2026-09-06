@@ -169,6 +169,7 @@ EVENT_NAMES = {
     "hook:recall_error": "recall.error",
     "hook:recall_graph_not_built": "recall.graph_not_built",
     "hook:recall_health_accounting_failed": "recall.health_accounting_failed",
+    "hook:recall_project_scope_skipped": "recall.project_scope_skipped",
     "hook:recall_server_down": "recall.server_down",
     "hook:recall_skipped_not_ready": "recall.skipped_not_ready",
     "hook:resolve_user_failed": "resolve.user_failed",

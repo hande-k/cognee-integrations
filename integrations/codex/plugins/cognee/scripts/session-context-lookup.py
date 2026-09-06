@@ -32,6 +32,7 @@ from _plugin_common import (
     quiet_hook_output,
     read_and_reset_save_counter,
     read_connection_state,
+    recall_node_sets,
     recall_via_http,
     record_slow_probe,
     resolve_runtime_mode,
@@ -411,6 +412,19 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
     server_down = False
     auth_rejected = False  # 401/403: the server answered and rejected OUR key
     server_errors = 0  # 5xx answers: reachable but failing
+    # Project scoping for the graph lane (the HTTP path resolves it from the same
+    # pinned state inside recall_via_http). A pending or errored project state
+    # means no scoping rather than a failed recall.
+    graph_node_sets: list = []
+    if not cloud_mode:
+        try:
+            from _project_memory import route as route_project_memory
+
+            graph_node_sets = recall_node_sets(
+                route_project_memory(get_dataset(config), session_id).get("node_set") or []
+            )
+        except Exception as exc:
+            hook_log("recall_project_scope_skipped", {"error": str(exc)[:200]})
     for scope_list, qtype, context_profile in scope_specs:
         # Clamp each call to what is left of the budget so a single scope can
         # never overshoot the deadline (previously a scope dispatched just
@@ -458,6 +472,11 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
                         **(
                             {"datasets": [scope_dataset], "code_query": scope_code_query}
                             if is_code_scope
+                            else {}
+                        ),
+                        **(
+                            {"node_name": graph_node_sets, "node_name_filter_operator": "OR"}
+                            if graph_node_sets and scope_list == ["graph"]
                             else {}
                         ),
                     ),
