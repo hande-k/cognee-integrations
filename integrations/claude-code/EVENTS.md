@@ -321,3 +321,5 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `hook:switch_aborted_handle_cleanup_failed` | `switch.aborted_handle_cleanup_failed` |
 | `idle-watcher:shared_memory_refresh_failed` | `idle_watcher.shared_memory_refresh_failed` |
 | `idle-watcher:shared_memory_refreshed` | `idle_watcher.shared_memory_refreshed` |
+| `hook:shared_memory_grant_denied` | `shared_memory.grant_denied` |
+| `hook:plugin_provision_retry_after_update` | `plugin.provision_retry_after_update` |

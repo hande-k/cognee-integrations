@@ -467,3 +467,130 @@ def test_principal_key_never_resolves_to_the_agent_key(
     assert pc.principal_key_for_control_plane("http://one.test") == "principal-1"
     monkeypatch.setenv("COGNEE_API_KEY", "env-principal")
     assert pc.principal_key_for_control_plane("http://one.test") == "env-principal"
+
+
+# ── review follow-ups ──────────────────────────────────────────────────────
+
+
+def test_auto_mode_fails_loudly_when_identity_unusable_and_no_principal(
+    pc, mock_server, monkeypatch
+):
+    """A blocked or foreign identity is never used; under ``auto`` the plugin
+    falls back to the principal — but with no principal anywhere it must raise
+    rather than run keyless and fail every request quietly."""
+    pc.save_cached_agent_key(mock_server.url, "agent-key-1", "agent-1", principal_key="other")
+    # Only the agent key is in the env (as the data plane leaves it), and no
+    # principal is preserved or cached.
+    monkeypatch.setenv("COGNEE_API_KEY", "agent-key-1")
+    monkeypatch.delenv("COGNEE_PRINCIPAL_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="no principal key"):
+        pc._api_key_with_source(mock_server.url)
+    # With a principal to fall back to, ``auto`` keeps working as the principal.
+    monkeypatch.setenv("COGNEE_PRINCIPAL_API_KEY", PRINCIPAL_KEY)
+    assert pc._api_key_with_source(mock_server.url) == (PRINCIPAL_KEY, "env_api_key")
+
+
+def test_parent_dataset_is_writable_via_role_only_once_granted(pc, mock_server, monkeypatch):
+    rows = [{"id": "ds-parent", "name": "shared", "ownerId": "parent"}]
+    monkeypatch.setattr(
+        pc,
+        "_json_http_request",
+        lambda path, *a, **k: rows if path == "/api/v1/datasets/" else [],
+    )
+    marker = {
+        "base_url": mock_server.url,
+        "mode": "shared",
+        "role_id": "role-1",
+        "agent_id": "agent-1",
+        "parent_user_id": "parent",
+        "granted": {},
+    }
+    pc._save_shared_memory_marker(dict(marker))
+    # Grant not (yet) confirmed: not offered as writable.
+    assert pc.list_writable_datasets("agent-1")["readonly_ids"] == ["ds-parent"]
+    pc._save_shared_memory_marker({**marker, "granted": {"ds-parent": "ok"}})
+    listing = pc.list_writable_datasets("agent-1")
+    assert [row["id"] for row in listing["datasets"]] == ["ds-parent"]
+    assert listing["datasets"][0]["writable"] is True
+
+
+def test_ungranted_same_named_dataset_is_kept_out_of_recall(
+    pc, bootstrap, mock_server, monkeypatch
+):
+    """A same-named dataset shared to the user read-only by someone else: the
+    parent cannot grant the role on it, so it is neither the write target nor in
+    the recall set, and the denial is logged once."""
+    ident = mock_server.identity
+    # A cloud-like principal that already owns a tenant (a tenant-less
+    # principal with readable data is a different, guarded case), sharing the
+    # tenant with a stranger whose same-named dataset is visible read-only.
+    _, tenant = ident.tenants_create(PRINCIPAL_KEY, "org")
+    stranger_key = ident.seed_owner_key("stranger@example.com")
+    stranger = ident.users["stranger@example.com"]["id"]
+    ident.tenant_add_user(PRINCIPAL_KEY, stranger, tenant["tenant_id"])
+    ident.tenant_select(stranger_key, tenant["tenant_id"])
+    foreign = ident.seed_dataset("agent_sessions", stranger)  # principal gets read only
+
+    module, run = bootstrap
+    _uid, agent_key, _n, ok = run({})
+    assert ok
+    write_id, read_ids = pc.resolve_active_dataset_ids("host-shared-1")
+    assert write_id and write_id != foreign["id"]  # the parent created its own copy
+    assert ident.dataset_rows[write_id]["ownerId"] == ident.principal_id
+    assert foreign["id"] not in read_ids
+    marker = pc.load_shared_memory_marker(mock_server.url)
+    assert isinstance(marker["granted"].get(foreign["id"]), dict)  # denied, memoised
+    # Logged once (session-start binds its own _plugin_common instance, so the
+    # shared hook log file is the observable, not a patched function).
+    import json as _json
+
+    logged = [
+        _json.loads(line)
+        for line in pc._HOOK_LOG.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    denied = [e for e in logged if e.get("event") == "shared_memory_grant_denied"]
+    assert [e["detail"]["dataset_id"] for e in denied] == [foreign["id"]]
+    # The recall set is fully readable by the agent (the fake 403s otherwise).
+    mock_server.set_recall_results([{"text": "ok"}])
+    assert pc.recall_via_http(
+        "q",
+        session_id="s1",
+        top_k=3,
+        scope=["graph"],
+        dataset="agent_sessions",
+        dataset_ids=read_ids,
+    ) == [{"text": "ok"}]
+
+
+def test_structural_reason_is_reevaluated_after_a_plugin_update(
+    suite, pc, bootstrap, mock_server, monkeypatch
+):
+    monkeypatch.setenv("COGNEE_API_KEY", PRINCIPAL_KEY)
+    module, run = bootstrap
+    marker = {"base_url": mock_server.url, "mode": "separated", "reason": "tenantless_with_data"}
+    # Recorded by THIS plugin version: still structural, no provisioning.
+    pc._save_shared_memory_marker(dict(marker))
+    _uid, api_key, _n, ok = run({"api_key": PRINCIPAL_KEY})
+    assert ok and api_key == PRINCIPAL_KEY
+    mock_server.assert_not_called("POST", f"/api/v1/integrations/plugins/{suite.name}/provision")
+    # Recorded by an older version: the limitation may be gone — try again.
+    pc._write_json_file(pc._SHARED_MEMORY_MARKER, {**marker, "plugin_version": "0.0.0"})
+    _uid, api_key, _n, ok = run({"api_key": PRINCIPAL_KEY})
+    assert ok
+    mock_server.assert_called("POST", f"/api/v1/integrations/plugins/{suite.name}/provision")
+
+
+def test_dataset_switch_is_serialized_per_launch(pc, monkeypatch):
+    from _file_lock import file_lock
+
+    monkeypatch.setenv("COGNEE_SWITCH_LOCK_TIMEOUT", "0.1")
+    pc.ensure_launch_record("host-lock", "/w", dataset="a")
+    lock_path = pc._session_map_path("host-lock").with_suffix(".switch.lock")
+    with file_lock(lock_path) as held:
+        assert held
+        with pytest.raises(RuntimeError, match="in progress"):
+            pc.switch_launch_record("host-lock", session_id="s2", dataset="b", conn_uuid="c2")
+    assert pc._read_map_record("host-lock")["dataset"] == "a"  # untouched
+    pc.switch_launch_record("host-lock", session_id="s2", dataset="b", conn_uuid="c2")
+    assert pc._read_map_record("host-lock")["dataset"] == "b"

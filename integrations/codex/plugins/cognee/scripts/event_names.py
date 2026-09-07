@@ -21,6 +21,8 @@ EVENT_NAMES = {
     "hook:shared_memory_skipped": "shared_memory.skipped",
     "hook:shared_memory_tenant_create_failed": "shared_memory.tenant_create_failed",
     "hook:shared_memory_wired": "shared_memory.wired",
+    "hook:shared_memory_grant_denied": "shared_memory.grant_denied",
+    "hook:plugin_provision_retry_after_update": "plugin.provision_retry_after_update",
     "hook:switch_aborted_handle_cleanup": "switch.aborted_handle_cleanup",
     "hook:switch_aborted_handle_cleanup_failed": "switch.aborted_handle_cleanup_failed",
     "idle-watcher:shared_memory_refresh_failed": "idle_watcher.shared_memory_refresh_failed",

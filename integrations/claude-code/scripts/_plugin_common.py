@@ -614,6 +614,34 @@ def switch_launch_record(
     host_key = _sanitize_session_key(host_key) or get_session_key()
     if not host_key:
         raise ValueError("switch_launch_record: no host session key")
+    from _file_lock import file_lock
+
+    # One switch at a time per launch: the write-then-verify below has no
+    # transactional guarantee, so a concurrent switch landing in between would
+    # make a successful write look unpersisted (and vice versa).
+    lock_path = _session_map_path(host_key).with_suffix(".switch.lock")
+    with file_lock(lock_path, timeout=_float_env("COGNEE_SWITCH_LOCK_TIMEOUT", 5.0)) as held:
+        if not held:
+            raise RuntimeError("Another dataset switch is in progress for this launch")
+        return _switch_launch_record_locked(
+            host_key,
+            session_id=session_id,
+            dataset=dataset,
+            conn_uuid=conn_uuid,
+            dataset_id=dataset_id,
+            dataset_ids=dataset_ids,
+        )
+
+
+def _switch_launch_record_locked(
+    host_key: str,
+    *,
+    session_id: str,
+    dataset: str,
+    conn_uuid: str,
+    dataset_id: str,
+    dataset_ids: list[str] | None,
+) -> dict:
     rec = _read_map_record(host_key)
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     touched = touched_pairs(host_key)
@@ -784,14 +812,21 @@ def list_writable_datasets(user_id: str = "", *, timeout: float = 15.0) -> dict:
             if exc.code not in (404, 405):
                 raise
     shared_parent = ""
+    role_granted: dict = {}
     shared = load_shared_memory_marker()
     if shared_memory_enabled() and shared.get("mode") == "shared":
         shared_parent = str(shared.get("parent_user_id") or "")
+        role_granted = shared.get("granted") if isinstance(shared.get("granted"), dict) else {}
     rows = []
     for item in items:
         owner = str(item.get("owner_id") or item.get("ownerId") or "")
         ident = str(item.get("id") or "")
-        via_role = bool(shared_parent) and owner == shared_parent
+        # Writable through the shared role only once the grant is confirmed —
+        # a transient failure leaves a parent-owned dataset ungranted until the
+        # next refresh, and it must not be offered as writable meanwhile.
+        via_role = (
+            bool(shared_parent) and owner == shared_parent and role_granted.get(ident) == "ok"
+        )
         if writable_ids is not None:
             writable = ident in writable_ids or via_role
         else:
@@ -1992,6 +2027,10 @@ def load_shared_memory_marker(service_url: str = "") -> dict:
 
 def _save_shared_memory_marker(marker: dict) -> None:
     marker["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # A structural reason is only structural for THIS plugin version: an
+    # update may lift the limitation (e.g. once the server re-stamps
+    # tenant-less datasets), so SessionStart re-evaluates it after an update.
+    marker["plugin_version"] = _installed_plugin_version()
     _write_json_file(_SHARED_MEMORY_MARKER, marker)
 
 
@@ -2260,11 +2299,12 @@ _GRANT_DENIED_RETRY_SECONDS = 3600.0
 
 def _grant_role_on_datasets(
     principal_key: str, role_id: str, dataset_ids: list[str], marker: dict
-) -> None:
+) -> set[str]:
     """Give the role read+write on each dataset (one call per dataset, so a
     single unshareable one — e.g. read-only shared by someone else — cannot
     fail the batch). Outcomes are memoised in ``marker["granted"]``:
-    ``"ok"`` never retried, a denial retried hourly."""
+    ``"ok"`` never retried, a denial retried hourly and logged when it is
+    new. Returns the ids the role holds read+write on."""
     granted = marker.setdefault("granted", {})
     if not isinstance(granted, dict):
         granted = marker["granted"] = {}
@@ -2286,6 +2326,14 @@ def _grant_role_on_datasets(
             )
             if status in (401, 403):
                 outcome = {"denied_at": now}
+                if not isinstance(prior, dict):
+                    # Typically a dataset shared to the user read-only by someone
+                    # else: the user cannot share it on, so the agents cannot
+                    # reach it. Said once per dataset, not once per hour.
+                    hook_log(
+                        "shared_memory_grant_denied",
+                        {"dataset_id": dataset_id, "permission": permission, "status": status},
+                    )
                 break
             if status != 200:
                 outcome = None  # transient: retry next time
@@ -2294,6 +2342,7 @@ def _grant_role_on_datasets(
             granted.pop(dataset_id, None)
             continue
         granted[dataset_id] = outcome
+    return {dataset_id for dataset_id, outcome in granted.items() if outcome == "ok"}
 
 
 def _pick_canonical(rows: list[dict], parent_id: str) -> dict:
@@ -2432,30 +2481,46 @@ def ensure_shared_memory(
     if datasets is None:
         datasets = list_datasets_via_http(principal_key)
 
-    # The launch's dataset: a canonical parent-owned copy every agent writes
-    # to (created as the parent when absent), plus other readable same-named
-    # copies for recall. Same-named copies can predate shared memory (each
-    # agent forked its own under name addressing); they stay readable.
-    write_id, read_ids = "", []
-    if dataset:
-        same_name = [row for row in datasets if row["name"] == dataset]
-        if not same_name:
-            created = create_dataset_via_http(principal_key, dataset)
-            if created:
-                created = {**created, "owner_id": parent_id, "created_at": ""}
-                same_name = [created]
-                datasets.append(created)
-        if same_name:
-            write_id = _pick_canonical(same_name, parent_id)["id"]
-            read_ids = [write_id] + [row["id"] for row in same_name if row["id"] != write_id]
-            canonical = marker.setdefault("canonical", {})
-            if isinstance(canonical, dict):
-                canonical[dataset] = write_id
-
     # Backfill: the role gets read+write on everything the parent can share.
     # Datasets a sibling agent creates are auto-shared to the parent, so this
     # is also how they reach every other agent — no per-plugin coordination.
-    _grant_role_on_datasets(principal_key, role_id, [row["id"] for row in datasets], marker)
+    role_holds = _grant_role_on_datasets(
+        principal_key, role_id, [row["id"] for row in datasets], marker
+    )
+
+    # The launch's dataset: a canonical copy every agent writes to, plus other
+    # same-named copies for recall. Only datasets the role actually holds (or
+    # the parent owns) qualify — a same-named dataset shared to the user
+    # read-only by someone else cannot be granted on, so it is neither the
+    # write target nor part of the recall set (one unreadable id would fail the
+    # whole recall). With no eligible copy the parent creates its own.
+    write_id, read_ids = "", []
+    if dataset:
+        same_name = [row for row in datasets if row["name"] == dataset]
+        eligible = [
+            row for row in same_name if row["owner_id"] == parent_id or row["id"] in role_holds
+        ]
+        if not eligible:
+            created = create_dataset_via_http(principal_key, dataset)
+            if created:
+                created = {**created, "owner_id": parent_id, "created_at": ""}
+                same_name.append(created)
+                datasets.append(created)
+                role_holds |= _grant_role_on_datasets(
+                    principal_key, role_id, [created["id"]], marker
+                )
+                eligible = [created]
+        if eligible:
+            write_id = _pick_canonical(eligible, parent_id)["id"]
+            canonical = marker.setdefault("canonical", {})
+            if isinstance(canonical, dict):
+                canonical[dataset] = write_id
+            read_ids = [write_id] + [
+                row["id"]
+                for row in same_name
+                if row["id"] != write_id
+                and (row["id"] in role_holds or row["owner_id"] == agent_id)
+            ]
     _save_shared_memory_marker(marker)
     return {
         "mode": "shared",
@@ -2625,9 +2690,15 @@ def _api_key_with_source(service_url: str = "") -> tuple[str, str]:
             return agent_key, "plugin_agent_key"
         # A rejected or foreign identity is never used. Explicit identity
         # (``true``) makes that an error; ``auto`` — identity only in service
-        # of shared memory — keeps the plugin working as the principal.
-        if mode == "enabled":
-            raise RuntimeError(problem)
+        # of shared memory — keeps the plugin working as the principal. With
+        # no principal to fall back to, ``auto`` must not run keyless either:
+        # that would fail every request quietly instead of naming the cause.
+        if mode == "enabled" or not principal:
+            raise RuntimeError(
+                problem
+                if principal
+                else problem + " — and no principal key is available (COGNEE_API_KEY unset)"
+            )
     if mode == "enabled":
         raise RuntimeError("Plugin identity is enabled but not connected; run SessionStart")
     if principal:

@@ -821,6 +821,7 @@ async def _ensure_plugin_identity(service_url: str, config: dict, principal_key:
     """
     from _plugin_common import (
         _AGENT_KEY_CACHE,
+        _installed_plugin_version,
         _load_json_file,
         _principal_fingerprint,
         load_cached_agent_key,
@@ -860,10 +861,16 @@ async def _ensure_plugin_identity(service_url: str, config: dict, principal_key:
         if not strict:
             if not shared_memory_enabled(config):
                 return ""
-            prior = str(load_shared_memory_marker(service_url).get("reason") or "")
+            marker = load_shared_memory_marker(service_url)
+            prior = str(marker.get("reason") or "")
             if prior in _STRUCTURAL_SHARED_MEMORY_FAILURES:
-                hook_log("plugin_provision_skipped", {"status": "shared_memory_" + prior})
-                return ""
+                # Structural for the plugin version that recorded it. After an
+                # update the limitation may be gone (server-side fixes ship
+                # with plugin bumps), so try once more instead of never again.
+                if marker.get("plugin_version") == _installed_plugin_version():
+                    hook_log("plugin_provision_skipped", {"status": "shared_memory_" + prior})
+                    return ""
+                hook_log("plugin_provision_retry_after_update", {"prior_reason": prior})
         status, body = provision_plugin_agent_via_http(
             principal_key=principal_key, service_url=service_url
         )
