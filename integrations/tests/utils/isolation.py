@@ -35,6 +35,11 @@ ISOLATED_MODULES = (
     "_cognee_client",
     "_env_file",
     "_logfiles",
+    "_file_lock",
+    "_deadlines",
+    "_capture_policy",
+    "event_names",
+    "_project_memory",
     "_proc",
     "_recall_http",
     "_remember_http",
@@ -69,7 +74,7 @@ DETERMINISTIC_ENV = {
 
 #: Env-var prefixes scrubbed from the inherited environment so a developer's
 #: exported COGNEE_*/LLM_* configuration can never leak into a test.
-_SCRUBBED_PREFIXES = ("COGNEE_", "LLM_", "CLAUDE_", "CODEX_")
+_SCRUBBED_PREFIXES = ("COGNEE_", "LLM_", "CLAUDE_", "CODEX_", "AGY_")
 
 
 def scrub_env_dict(env: dict[str, str]) -> dict[str, str]:
@@ -78,7 +83,7 @@ def scrub_env_dict(env: dict[str, str]) -> dict[str, str]:
 
 
 def scrub_cognee_env(monkeypatch) -> None:
-    """Delete all COGNEE_*/LLM_*/CLAUDE_*/CODEX_* vars for one test (in-process)."""
+    """Delete all Cognee and host-integration vars for one test (in-process)."""
     for key in list(os.environ):
         if key.startswith(_SCRUBBED_PREFIXES):
             monkeypatch.delenv(key, raising=False)

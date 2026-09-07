@@ -33,6 +33,7 @@ from _env_file import load_env_file
 from _logfiles import append_line as _append_log_line
 from _logfiles import rotate_if_oversized as _rotate_log_if_oversized
 from _recall_http import DOWN, SLOW, UNKNOWN, classify_transport_exception
+from event_names import event_fields
 
 # One-time config: ~/.cognee/.env acts like shell exports (setdefault — a real
 # export still wins). Loaded before any env read below or in importers.
@@ -893,8 +894,12 @@ def _resolve_agent_name() -> str:
     return _normalize("claude-code-agent")
 
 
-def load_resolved(session_key: str = "") -> dict:
-    """Load runtime state from Cognee HTTP endpoints (no file cache)."""
+def load_resolved(session_key: str = "", *, identity: bool = True) -> dict:
+    """Resolve local session state, optionally enriching identity over HTTP.
+
+    Prompt recall only needs local fields. Passing ``identity=False`` keeps
+    identity probes outside that latency-sensitive path.
+    """
     resolved: dict = {}
 
     active_session_key = _sanitize_session_key(session_key) or get_session_key()
@@ -921,6 +926,9 @@ def load_resolved(session_key: str = "") -> dict:
     api_key = _api_key().strip()
     if api_key:
         resolved["api_key"] = api_key
+
+    if not identity:
+        return resolved
 
     # Resolve active connection details FIRST — it doubles as the primary
     # identity source. The connection is registered under the per-launch
@@ -1308,6 +1316,7 @@ def hook_log(event: str, detail: Optional[dict] = None) -> None:
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "pid": os.getpid(),
             "event": event,
+            **event_fields(event, "hook"),
         }
         if detail:
             line["detail"] = detail
@@ -4039,9 +4048,15 @@ def remember_entry_via_http(
     """
     if not dataset or not session_id:
         return None
+    from _project_memory import route
+
+    target = route(dataset, session_id)
+    dataset = target["write"]
     if parse_dataset_id(dataset):
         require_typed_dataset_id_support()
     entry = _sanitize_value(entry)
+    if target.get("node_set") and entry.get("type") in ("qa", "trace"):
+        entry = {**entry, "node_set": target["node_set"]}
     # The canonical UUID under shared memory (explicit, or resolved from the
     # launch record) wins: a name only resolves among datasets the caller owns.
     # Otherwise a UUID-shaped dataset is sent as an id and a name as a name.
@@ -4243,8 +4258,12 @@ def register_agent_via_http(
         # key and re-provision instead of failing the whole bootstrap.
         return False, {"auth_failed": exc.code in (401, 403)}
     except Exception as exc:
-        hook_log("agent_register_failed", {"error": str(exc)[:200]})
-        return False, {}
+        status = exc.code if isinstance(exc, urllib.error.HTTPError) else None
+        if status == 404:
+            hook_log("agent_lifecycle_unsupported", {"operation": "register", "status": status})
+            return False, {"lifecycle_supported": False}
+        hook_log("agent_register_failed", {"error": str(exc)[:200], "status": status})
+        return False, {"status_code": status}
 
 
 def unregister_agent_via_http(
@@ -4262,6 +4281,9 @@ def unregister_agent_via_http(
             return True, count
         return True, 0
     except Exception as exc:
+        if isinstance(exc, urllib.error.HTTPError) and exc.code == 404:
+            hook_log("agent_lifecycle_unsupported", {"operation": "unregister", "status": 404})
+            return True, 0
         hook_log("agent_unregister_failed", {"error": str(exc)[:200]})
         return False, 0
 
@@ -4321,14 +4343,37 @@ def recall_via_http(
         payload["search_type"] = search_type
     if context_profile:
         payload["context_profile"] = context_profile
-    result = _json_http_request("/api/v1/recall", payload, timeout=timeout)
-    return result if isinstance(result, list) else []
+    from _deadlines import bounded_call
+    from _project_memory import route
+
+    target = route(dataset, session_id) if dataset and not code_query else {"write": dataset}
+    if dataset:
+        payload["datasets"] = [target["write"]]
+
+    def fetch_scopes():
+        started = time.monotonic()
+        result = _json_http_request("/api/v1/recall", payload, timeout=timeout)
+        result = result if isinstance(result, list) else []
+        if dataset != target["write"] and "graph" in scope:
+            remaining = timeout - (time.monotonic() - started)
+            if remaining > 0.05:
+                primary_payload = {**payload, "datasets": [dataset], "scope": ["graph"]}
+                primary_payload.pop("session_id", None)
+                try:
+                    extra = _json_http_request("/api/v1/recall", primary_payload, timeout=remaining)
+                    if isinstance(extra, list):
+                        result.extend(extra)
+                except (OSError, TimeoutError):
+                    pass
+        return result
+
+    return bounded_call(fetch_scopes, timeout)
 
 
 def _backend_reachable(base_url: str, timeout: float = 1.5) -> bool:
     try:
         with urllib.request.urlopen(
-            f"{base_url.rstrip('/')}/docs", timeout=timeout, context=_https_context()
+            f"{base_url.rstrip('/')}/health", timeout=timeout, context=_https_context()
         ) as resp:
             return 200 <= resp.status < 500
     except (urllib.error.URLError, TimeoutError, OSError):
@@ -4514,6 +4559,11 @@ def drain_warmup_entries(
     ``deduped``). If the detail read fails, everything replays as before: a
     rare duplicate beats a lost turn.
     """
+    from _capture_policy import allow_tool, capture_enabled, redact
+
+    if not capture_enabled():
+        return 0, 0
+
     if not dataset or not session_id:
         return 0, 0
     path = _bridge_file(session_id)
@@ -4588,6 +4638,12 @@ def drain_warmup_entries(
                 deduped += 1
                 continue
             try:
+                if send_entry.get("type") == "trace" and not allow_tool(
+                    str(send_entry.get("origin_function", "")), send_entry.get("method_params", {})
+                ):
+                    deduped += 1
+                    continue
+                send_entry = redact(send_entry)
                 remember_entry_via_http(
                     dataset,
                     session_id,
@@ -4682,6 +4738,9 @@ def improve_session_via_http(dataset: str, session_id: str, *, timeout: float = 
     """
     if not dataset or not session_id:
         return {"ok": False, "error": "missing dataset/session"}
+    from _project_memory import route
+
+    dataset = route(dataset, session_id)["write"]
     submit_timeout = (
         timeout if timeout is not None else _float_env("COGNEE_IMPROVE_SUBMIT_TIMEOUT", 180.0)
     )
