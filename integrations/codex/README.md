@@ -211,16 +211,18 @@ list and the session-end sync covers them again as a safety net. The script behi
 
 ## Session sync and watchers
 
-Session→graph sync runs through Cognee's session-aware `improve` endpoint: the server bridges the session from its own session cache (feedback weights, Q&A persist, compact trace-feedback persist, distillation, enrichment) instead of the plugin re-posting the full accumulated session text — which used to trigger a complete re-cognify of the whole transcript on every sync. Servers without session-aware improve automatically fall back to the legacy document bridge.
+Session→graph sync runs through Cognee's session-aware `improve` endpoint: the server bridges the session from its own session cache (feedback weights, Q&A persist, compact trace-feedback persist, distillation, enrichment) instead of the plugin re-posting the full accumulated session text — which used to trigger a complete re-cognify of the whole transcript on every sync. There is no fallback: a server without session-aware improve (`/api/v1/improve` answering 404/405/422) is logged as `improve_unsupported` and the session is reported as not synced.
 
-An idle watcher runs in the background for the lifetime of each launch. It polls activity every `COGNEE_IDLE_POLL` seconds and fires an improve when the session has been quiet for `COGNEE_IDLE_THRESHOLD` seconds, then waits at least `COGNEE_IMPROVE_COOLDOWN` seconds before the next run. An automatic improve also fires every `COGNEE_AUTO_IMPROVE_EVERY` stored tool calls/stops.
+An idle watcher runs in the background for the lifetime of each launch. It polls activity every `COGNEE_IDLE_POLL` seconds and fires an improve when the session has been quiet for `COGNEE_IDLE_THRESHOLD` seconds. An automatic improve also fires every `COGNEE_AUTO_IMPROVE_EVERY` stored tool calls/stops (`0` disables it).
+
+Both of those automatic triggers share one **per-session cooldown**: after any successful improve of a session (idle, auto, manual or final), no further idle/auto improve runs for `COGNEE_IMPROVE_COOLDOWN` seconds, and none runs at all until at least one new prompt, tool call or answer has been stored since. The timestamp and turn count are persisted per session under `~/.cognee-plugin/codex/improve-state/`, so they survive the watcher process, which exits after each bridge and is respawned on the next prompt. (Until 1.4.4 the cooldown lived only in that process's memory and was reset on every respawn, so in practice an improve ran after every prompt.) The session-end final sync, the `/cognee-memory:cognee-sync` skill and the dataset-switch sync ignore the cooldown and always run.
 
 | Env var | Default | Effect |
 |---|---|---|
 | `COGNEE_IDLE_POLL` | `10` | Poll interval in seconds |
 | `COGNEE_IDLE_THRESHOLD` | `60` | Seconds of inactivity before idle improve fires |
-| `COGNEE_IMPROVE_COOLDOWN` | `600` | Minimum seconds between idle improve runs |
-| `COGNEE_AUTO_IMPROVE_EVERY` | `150` | Stored tool calls/stops between automatic improves (0 disables) |
+| `COGNEE_IMPROVE_COOLDOWN` | `600` | Minimum seconds between automatic (idle/auto) improves of one session; persisted per session |
+| `COGNEE_AUTO_IMPROVE_EVERY` | `150` | Stored tool calls/stops between automatic improves (`0` disables) |
 | `COGNEE_IMPROVE_SUBMIT_TIMEOUT` | `180` | Read timeout for the improve POST (distillation runs inside the request) |
 | `COGNEE_IMPROVE_BUSY_DEADLINE` | `600` | How long to wait for a concurrent improve's session lock before giving up |
 | `COGNEE_IMPROVE_BUSY_RETRY_INTERVAL` | `15` | Seconds between re-submits while the session lock is held |
@@ -362,8 +364,8 @@ where a boot that failed before the server could open its own log explains itsel
 At every SessionStart the plugin also sweeps its own state directory: per-session
 files whose session is over (status markers, bridge caches and pending buffers
 untouched for a week; launch records a week after their host process died, or
-after 30 days), improve locks whose owner is gone, an expired
-`improve-unsupported.json`, and directories older versions left behind. It
+after 30 days), improve locks whose owner is gone, improve-state files
+untouched for a week, and directories older versions left behind. It
 never touches another plugin's subdirectory. One `state_sweep` line in
 `hook.log` records what was removed.
 
@@ -505,8 +507,8 @@ Keys are letters, digits, and underscores. Values are taken literally — no `$V
 | local LLM | `LLM_API_KEY`, `LLM_MODEL` | unset | Required for local mode runtime |
 | idle watcher poll | `COGNEE_IDLE_POLL` | `10` | Idle watcher poll interval in seconds |
 | idle watcher threshold | `COGNEE_IDLE_THRESHOLD` | `60` | Seconds of inactivity before idle improve fires |
-| idle watcher cooldown | `COGNEE_IMPROVE_COOLDOWN` | `600` | Minimum seconds between idle improve runs |
-| auto-improve threshold | `COGNEE_AUTO_IMPROVE_EVERY` | `150` | Stored tool calls/stops between automatic improves (0 disables) |
+| improve cooldown | `COGNEE_IMPROVE_COOLDOWN` | `600` | Minimum seconds between automatic (idle/auto) improves of one session |
+| auto-improve threshold | `COGNEE_AUTO_IMPROVE_EVERY` | `150` | Stored tool calls/stops between automatic improves (`0` disables) |
 | improve submit timeout | `COGNEE_IMPROVE_SUBMIT_TIMEOUT` | `180` | Read timeout for the improve POST |
 
 ## Troubleshooting
@@ -547,3 +549,44 @@ curl -sS http://localhost:8011/health
 **Final sync diagnostics**
 - Check `~/.cognee-plugin/codex/hook.log` and `~/.cognee-plugin/codex/exit-watcher.log`.
 - Relevant logs: `sync_deferred_to_shutdown_worker`, `final_sync_once_*`, `agent_unregister_result`.
+
+### Automatic capture controls and compatible HTTP backends
+
+The plugin supports the same automatic capture policy as Claude Code: set
+`COGNEE_CAPTURE=false` in the host environment or `~/.cognee/.env` to keep recall
+and explicit remember while stopping prompt, answer and trace capture and buffered
+replay. `COGNEE_CAPTURE_TOOLS` is a pipe-separated allowlist of tool names/globs.
+`COGNEE_CAPTURE_DENY_PATHS` extends the default credential/private-key path patterns.
+`COGNEE_CAPTURE_REDACT=true` is the default; common secrets are redacted before
+truncation and storage. `COGNEE_CAPTURE_REDACT_PATTERNS` accepts a JSON array of
+additional regexes. Invalid expressions prevent affected content from being stored.
+Redaction is best effort; the master switch is the strict opt-out. This does not
+erase existing memory or buffers, and path exclusions inspect structured tool path
+arguments rather than arbitrary shell commands.
+
+Backend reachability uses `/health`. Missing optional lifecycle routes (404) do
+not prevent startup; 401/403, transport failures and server failures remain errors.
+Prompt recall enforces an elapsed-time deadline as well as socket timeouts.
+
+
+### Project tags and companion sessions
+
+`COGNEE_PROJECT_NODE_SET=auto` tags captured QA and traces with a readable project
+name plus a hash of the canonical path; a fixed value provides an explicit tag.
+The setting is pinned for the session, including buffered writes and detached
+improve workers. The backend must expose `node_set` on typed QA/trace entries and
+preserve it through improve. Older backends leave capture queued with an explicit
+`project_memory_prepared` error instead of silently losing the tags.
+
+`COGNEE_SESSION_COMPANION_DATASET=true` asks the backend to provision
+`<primary>-agent_sessions`. Writes and improve use the companion only after the
+server attests its permission snapshot. Graph recall reads both datasets in
+separate requests so primary graph reads do not conflict with the session binding.
+Unsupported routes, insufficient rights, collisions and permission mismatches
+fall back to the primary. The client never reads local SQL tables for remote ACLs.
+
+These options require the server project-tags/session-companion extension. The
+companion endpoint currently requires the primary owner and copies an ACL snapshot;
+later sharing changes must be reconciled explicitly. Connection credentials are
+hashed in the local decision record, and a changed principal cannot reuse it.
+Defaults remain off. Start a new host session when changing project routing policy.

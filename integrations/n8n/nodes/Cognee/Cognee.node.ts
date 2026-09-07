@@ -33,6 +33,16 @@ import {
 import type { ForgetMode, MemoryEntryType, RecallOptions } from './payloads';
 
 /**
+ * Completion search strategies shared by the Search and Recall operations, so
+ * the two ops never drift apart. Recall prepends an Auto entry to this list.
+ */
+const SEARCH_COMPLETION_TYPES: INodePropertyOptions[] = [
+  { name: 'GraphCompletion', value: 'GRAPH_COMPLETION' },
+  { name: 'ChainOfThought', value: 'GRAPH_COMPLETION_COT' },
+  { name: 'RagCompletion', value: 'RAG_COMPLETION' },
+];
+
+/**
  * preSend hook for Add Data: POST /v1/add only accepts content as uploaded
  * files, so each text item is encoded as a multipart file part together with
  * the dataset and optional fields. Replaces the JSON body n8n would send.
@@ -382,6 +392,93 @@ async function parseReviewScore(
   ];
 }
 
+/**
+ * Multi-value string parameters reach preSend as whatever the user's
+ * expression resolved to, so a single expression yielding a plain string must
+ * become a one-element array rather than being iterated character by character.
+ */
+function toStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map(String).filter(Boolean);
+  return value ? [String(value)] : [];
+}
+
+/**
+ * preSend for the Recall operation. Builds the whole JSON body in one place:
+ * search_type is an explicit null for Auto (the backend's opt-in to
+ * auto-routing), and the optional fields (datasets, session_id, node_name) are
+ * omitted entirely when empty instead of being sent as null.
+ */
+async function buildRecallBody(
+  this: IExecuteSingleFunctions,
+  requestOptions: IHttpRequestOptions,
+): Promise<IHttpRequestOptions> {
+  const searchType = this.getNodeParameter('recallSearchType', 'AUTO') as string;
+  const datasets = toStringArray(this.getNodeParameter('recallDatasets', []));
+  const sessionId = this.getNodeParameter('recallSessionId', '') as string;
+  const nodeName = toStringArray(this.getNodeParameter('recallNodeName', []));
+  const topK = this.getNodeParameter('recallTopK', 15) as number;
+
+  const body: IDataObject = {
+    search_type: searchType === 'AUTO' ? null : searchType,
+    query: this.getNodeParameter('recallQuery', '') as string,
+    scope: this.getNodeParameter('recallScope', 'auto') as string,
+  };
+  if (datasets.length) body.datasets = datasets;
+  if (sessionId) body.session_id = sessionId;
+  if (nodeName.length) body.node_name = nodeName;
+  if (topK > 0) body.top_k = topK;
+  requestOptions.body = body;
+  return requestOptions;
+}
+
+/** One plain (non-file) field of a multipart/form-data body. */
+function multipartField(boundary: string, name: string, value: string): string {
+  return `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`;
+}
+
+/**
+ * preSend for the Remember operation. /v1/remember is multipart ingest, so the
+ * Text field is sent as an uploaded note.txt file part alongside datasetName,
+ * datasetId, session_id, run_in_background and one node_set form field per
+ * tag. The multipart body is assembled by hand into a Buffer with an explicit
+ * boundary header: n8n Cloud forbids the form-data package (no runtime deps
+ * for community nodes) and a native WHATWG FormData body is only serialized
+ * correctly on hosts bundling a new-enough axios, so neither is portable.
+ * This is the one-shot add+cognify path with session attribution and node-set
+ * tagging.
+ */
+async function buildRememberForm(
+  this: IExecuteSingleFunctions,
+  requestOptions: IHttpRequestOptions,
+): Promise<IHttpRequestOptions> {
+  const text = this.getNodeParameter('rememberText', '') as string;
+  const datasetName = this.getNodeParameter('rememberDatasetName', '') as string;
+  const datasetId = this.getNodeParameter('rememberDatasetId', '') as string;
+  const sessionId = this.getNodeParameter('rememberSessionId', '') as string;
+  const nodeSet = toStringArray(this.getNodeParameter('rememberNodeSet', []));
+  const runInBackground = this.getNodeParameter('rememberRunInBackground', true) as boolean;
+
+  const boundary = `----n8nCogneeRemember${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`;
+  const parts: string[] = [
+    `--${boundary}\r\nContent-Disposition: form-data; name="data"; filename="note.txt"\r\nContent-Type: text/plain\r\n\r\n${text}\r\n`,
+    multipartField(boundary, 'datasetName', datasetName),
+  ];
+  if (datasetId) parts.push(multipartField(boundary, 'datasetId', datasetId));
+  if (sessionId) parts.push(multipartField(boundary, 'session_id', sessionId));
+  for (const tag of nodeSet) {
+    parts.push(multipartField(boundary, 'node_set', tag));
+  }
+  parts.push(multipartField(boundary, 'run_in_background', runInBackground ? 'true' : 'false'));
+  parts.push(`--${boundary}--\r\n`);
+
+  requestOptions.body = Buffer.from(parts.join(''), 'utf-8');
+  requestOptions.headers = {
+    ...requestOptions.headers,
+    'Content-Type': `multipart/form-data; boundary=${boundary}`,
+  };
+  return requestOptions;
+}
+
 export class Cognee implements INodeType {
   methods = {
     loadOptions: {
@@ -437,6 +534,8 @@ export class Cognee implements INodeType {
           { name: 'Cognify', value: 'cognify' },
           { name: 'Dataset', value: 'dataset' },
           { name: 'Delete', value: 'delete' },
+          { name: 'Recall', value: 'recall' },
+          { name: 'Remember', value: 'remember' },
           { name: 'Memory', value: 'memory' },
           { name: 'Search', value: 'search' },
           { name: 'Session', value: 'session' },
@@ -553,6 +652,69 @@ export class Cognee implements INodeType {
           },
         ],
         default: 'search',
+      },
+      {
+        displayName: 'Operation',
+        name: 'operation',
+        type: 'options',
+        noDataExpression: true,
+        displayOptions: {
+          show: {
+            resource: ['recall'],
+          },
+        },
+        options: [
+          {
+            name: 'Recall',
+            value: 'recall',
+            action: 'Recall from cognee memory',
+            description: 'Memory-oriented search over cognee: like Search, with session, node-set and auto-routing (search_type null)',
+            routing: {
+              send: {
+                preSend: [buildRecallBody],
+              },
+              request: {
+                method: 'POST',
+                url: '/v1/recall',
+                headers: {
+                  'Content-Type': 'application/json',
+                },
+                timeout: 300000, // 5 minutes
+              },
+            },
+          },
+        ],
+        default: 'recall',
+      },
+      {
+        displayName: 'Operation',
+        name: 'operation',
+        type: 'options',
+        noDataExpression: true,
+        displayOptions: {
+          show: {
+            resource: ['remember'],
+          },
+        },
+        options: [
+          {
+            name: 'Remember',
+            value: 'remember',
+            action: 'Remember data into cognee memory',
+            description: 'One-shot add + cognify of text with session attribution and node-set tagging',
+            routing: {
+              send: {
+                preSend: [buildRememberForm],
+              },
+              request: {
+                method: 'POST',
+                url: '/v1/remember',
+                timeout: 600000, // 10 minutes
+              },
+            },
+          },
+        ],
+        default: 'remember',
       },
       {
         displayName: 'Operation',
