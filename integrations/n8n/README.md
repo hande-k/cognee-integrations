@@ -9,8 +9,6 @@ This community node lets you:
 - Add text data to a Cognee dataset
 - Turn data into AI memory with cognify, and enrich an existing graph with memify
 - Run search over your AI memory datasets
-- Recall from memory: a search alias with session, node-set filtering and auto-routing
-- Remember text: one-shot add + cognify with session attribution and node-set tagging
 - Manage datasets: create, list, inspect data items, poll processing status
 - Inspect sessions and their usage
 - Delete datasets or individual data items
@@ -168,53 +166,6 @@ Every "Dataset Name or ID" field is a dropdown loaded from your datasets; an exp
 - **Operation: Get Many** — `GET /api/v1/sessions`: Time Range (24h / 7d / 30d / all), Limit; Options: Status, Order By, Descending, Offset. One item per session.
 - **Operation: Get** — `GET /api/v1/sessions/{sessionId}`: full session detail including Q&A and trace entries, usage and cost
 
-### Resource: Recall (`/api/v1`)
-
-Search wearing a memory hat. Same response as **Search**, plus session, node-set filtering, and an **Auto** search type that lets cognee route the query for you.
-
-- **Operation**: Recall
-- **Endpoint**: `POST /api/v1/recall`
-- **Fields**:
-  - Search Type (`search_type`): `Auto` (default; sends `null` for auto-routing), `GRAPH_COMPLETION`, `GRAPH_COMPLETION_COT`, or `RAG_COMPLETION`
-  - Query (`query`, required)
-  - Datasets (`datasets`, optional, multiple): omit to search every dataset you can read
-  - Session ID (`session_id`, optional): recall from a session's cached QA/trace entries
-  - Node Names (`node_name`, optional, multiple): restrict to node sets tagged via Remember/Add
-  - Scope (`scope`): `auto`, `graph`, `session`, `trace`, `graph_context`, or `all`
-  - Top K (`top_k`, optional number): defaults to 15
-
-**vs Search**: Recall hits `/api/v1/recall` (search's memory alias) and adds `session_id`, `node_name` and `scope`, plus an Auto type that sends `search_type: null`. The response shape matches Search (raw body passthrough).
-
-Example body sent by the node:
-
-```json
-{
-  "search_type": null,
-  "query": "How do I export my data?",
-  "datasets": ["support_docs"],
-  "session_id": "claude-code-1718000000",
-  "node_name": ["support"],
-  "scope": "auto",
-  "top_k": 15
-}
-```
-
-### Resource: Remember (`/api/v1`)
-
-Without a Session ID, Remember ingests text and builds the knowledge graph in one call. With a Session ID, it writes to the session cache; the server bridges that session into the graph separately. Node-set tags are included in the request.
-
-- **Operation**: Remember
-- **Endpoint**: `POST /api/v1/remember` (multipart form)
-- **Fields**:
-  - Dataset Name (`datasetName`, required): created if it does not exist
-  - Dataset ID (`datasetId`, optional): UUID of an existing dataset, used instead of resolving by name
-  - Text (`rememberText`, required): sent as an uploaded `.txt` file part
-  - Session ID (`session_id`, optional): store the memory in the session cache (tracked in the sessions dashboard); this does not promise immediate graph ingestion
-  - Node Sets (`node_set`, optional, multiple): tag the data so Recall/Search can later filter to it
-  - Run in Background (`run_in_background`, default on): the request returns as soon as the work is enqueued. Disable to wait synchronously; note the Cognee Cloud gateway closes long-running connections around the 4-minute mark, so non-trivial texts fail with ECONNRESET in sync mode.
-
-**vs Add + Cognify**: Remember does add and cognify in one request. What it buys you over two nodes is `session_id` attribution and `node_set` tagging. If you only need plain-text ingest without those, **Add Data** + **Cognify** does the same job.
-
 ### Resource: Delete
 
 - **Operation**: Delete Dataset
@@ -311,7 +262,7 @@ The node depends on `n8n-workflow` at runtime (peer dependency). It should work 
 
 ## Version history
 
-- **Unreleased**: Add the **Dataset** resource (Get Many, Create, Get Data Items, Get Status, Get Progress) and **Session** resource (Get Many, Get); Memify under Cognify; Update under Memory; Get Many and Delete Skill under Skill. Dataset ID fields become dropdowns loaded from your datasets. Add the **Memory** resource: Remember (text or binary file, multipart), Remember Entry (qa / trace / feedback session entries), Recall (all search types plus Auto routing, session scope, Simplify output) and Forget (dataset, data item, memory-only, or everything behind a confirmation toggle). Move Add Data, Cognify, Search and Delete to the `/api/v1` endpoints (the legacy `/api/add_text`, `/api/cognify`, `/api/search` routes are no longer served). Add Data now uploads text as multipart file parts and gains Node Set / Run in Background. Search exposes all Cognee search types plus Dataset IDs, System Prompt, Only Context, Node Sets, Session ID, Include References and Verbose. Cognify gains Dataset IDs, Custom Prompt, Chunk Size and Ontology Keys. Icons now have light/dark variants; toolchain upgraded to `@n8n/node-cli` 0.46 with vitest unit tests.
+- **0.6.0**: Add the **Dataset** resource (Get Many, Create, Get Data Items, Get Status, Get Progress) and **Session** resource (Get Many, Get); Memify under Cognify; Update under Memory; Get Many and Delete Skill under Skill. Dataset ID fields become dropdowns loaded from your datasets. Add the **Memory** resource: Remember (text or binary file, multipart), Remember Entry (qa / trace / feedback session entries), Recall (all search types plus Auto routing, session scope, Simplify output) and Forget (dataset, data item, memory-only, or everything behind a confirmation toggle). Move Add Data, Cognify, Search and Delete to the `/api/v1` endpoints (the legacy `/api/add_text`, `/api/cognify`, `/api/search` routes are no longer served). Add Data now uploads text as multipart file parts and gains Node Set / Run in Background. Search exposes all Cognee search types plus Dataset IDs, System Prompt, Only Context, Node Sets, Session ID, Include References and Verbose. Cognify gains Dataset IDs, Custom Prompt, Chunk Size and Ontology Keys. Icons now have light/dark variants; toolchain upgraded to `@n8n/node-cli` 0.46 with vitest unit tests. Recall and Remember close topoteretes/cognee#3560.
 
 - **0.5.0**: Add the **Skill** resource (self-improving skill loop) targeting the `/api/v1` API: Ingest Skill, Review Skill (agentic), Propose Improvement, Apply Improvement, Get Skill, Get Proposal. Existing Add/Cognify/Search/Delete operations are unchanged.
 
