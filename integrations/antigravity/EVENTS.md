@@ -310,3 +310,24 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `hook:sync_execution_skipped_not_idle` | `lifecycle.sync_execution_skipped_not_idle` |
 
 | `hook:sync_worker_detached` | `lifecycle.sync_worker_detached` |
+| `hook:control_plane_request_failed` | `shared_memory.control_plane_request_failed` |
+| `hook:plugin_agent_provisioned` | `plugin.agent_provisioned` |
+| `hook:plugin_disconnect_failed` | `plugin.disconnect_failed` |
+| `hook:plugin_identity_rejected_fallback` | `plugin.identity_rejected_fallback` |
+| `hook:plugin_identity_reverted` | `plugin.identity_reverted` |
+| `hook:plugin_identity_skipped` | `plugin.identity_skipped` |
+| `hook:plugin_provision_bad_response` | `plugin.provision_bad_response` |
+| `hook:plugin_provision_failed` | `plugin.provision_failed` |
+| `hook:plugin_provision_skipped` | `plugin.provision_skipped` |
+| `hook:shared_memory_agent_select_tenant_failed` | `shared_memory.agent_select_tenant_failed` |
+| `hook:shared_memory_leave_role_failed` | `shared_memory.leave_role_failed` |
+| `hook:shared_memory_opted_out` | `shared_memory.opted_out` |
+| `hook:shared_memory_resolved` | `shared_memory.resolved` |
+| `hook:shared_memory_role_create_failed` | `shared_memory.role_create_failed` |
+| `hook:shared_memory_skipped` | `shared_memory.skipped` |
+| `hook:shared_memory_tenant_create_failed` | `shared_memory.tenant_create_failed` |
+| `hook:shared_memory_wired` | `shared_memory.wired` |
+| `hook:switch_aborted_handle_cleanup` | `switch.aborted_handle_cleanup` |
+| `hook:switch_aborted_handle_cleanup_failed` | `switch.aborted_handle_cleanup_failed` |
+| `idle-watcher:shared_memory_refresh_failed` | `idle_watcher.shared_memory_refresh_failed` |
+| `idle-watcher:shared_memory_refreshed` | `idle_watcher.shared_memory_refreshed` |

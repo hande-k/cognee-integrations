@@ -22,11 +22,12 @@ under test (see session-start.py `_ensure_plugin_identity`):
 from __future__ import annotations
 
 import asyncio
+import urllib.error
 
 import pytest
 
 #: Self-declared connection type per suite (KNOWN_AGENT_CONNECTION_TYPES).
-CONNECTION_TYPE = {"claude-code": "claude_code", "codex": "codex"}
+CONNECTION_TYPE = {"claude-code": "claude_code", "codex": "codex", "antigravity": "antigravity"}
 
 #: Provision route per suite (the plugin key is the suite name for both).
 PROVISION_PATH = {
@@ -244,9 +245,11 @@ def test_revoked_agent_key_stays_disconnected(suite, pc, bootstrap, mock_server)
 
     # Under ``auto`` the rejected key is blocked and the launch falls back to
     # the principal — which the forced 401 also rejects, so the bootstrap
-    # fails; on the way it must never have re-provisioned.
-    with pytest.raises(RuntimeError, match="Failed to register"):
+    # fails with the classified HTTP status; on the way it must never have
+    # re-provisioned.
+    with pytest.raises(urllib.error.HTTPError) as rejected:
         run({})
+    assert rejected.value.code == 401
     calls = [c for c in mock_server.calls if c["path"] == PROVISION_PATH[suite.name]]
     assert len(calls) == 0
     assert pc._load_json_file(pc._AGENT_KEY_CACHE)["blocked"] is True

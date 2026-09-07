@@ -4252,18 +4252,17 @@ def register_agent_via_http(
         if isinstance(result, dict):
             return True, result
         return True, {}
-    except urllib.error.HTTPError as exc:
-        hook_log("agent_register_failed", {"status": exc.code, "error": str(exc)[:200]})
-        # Surface auth rejection so SessionStart can drop a revoked plugin-agent
-        # key and re-provision instead of failing the whole bootstrap.
-        return False, {"auth_failed": exc.code in (401, 403)}
     except Exception as exc:
         status = exc.code if isinstance(exc, urllib.error.HTTPError) else None
         if status == 404:
+            # The lifecycle routes are optional server-side: a missing register
+            # route is a capability verdict, not a failed session.
             hook_log("agent_lifecycle_unsupported", {"operation": "register", "status": status})
             return False, {"lifecycle_supported": False}
         hook_log("agent_register_failed", {"error": str(exc)[:200], "status": status})
-        return False, {"status_code": status}
+        # status_code lets SessionStart raise a classified HTTPError; auth_failed
+        # lets it block a revoked plugin-agent key instead of failing outright.
+        return False, {"status_code": status, "auth_failed": status in (401, 403)}
 
 
 def unregister_agent_via_http(
@@ -4317,10 +4316,15 @@ def recall_via_http(
     # readable dataset and then reconciles against the session's binding, so the
     # graph scope depends on that binding existing: an unbound session with more
     # than one readable dataset is rejected as ambiguous rather than searched.
-    # Naming the dataset makes the scope explicit and matches the explicit-search
-    # path (_recall_http.do_recall), which has always sent it. The value must be
-    # the dataset the session's entries were written under — a different one is a
-    # binding mismatch server-side, which is a real error worth surfacing.
+    # The value must be the dataset the session's entries were written under — a
+    # different one is a binding mismatch server-side, a real error worth surfacing.
+    # Project memory may route this session's writes to a companion dataset; the
+    # recall scope follows that routing (the primary is searched separately below).
+    from _deadlines import bounded_call
+    from _project_memory import route
+
+    target = route(dataset, session_id) if dataset and not code_query else {"write": dataset}
+    write_dataset = target["write"]
     # Three sources of scope, in precedence order:
     #   1. COGNEE_PLUGIN_READ_DATASET_IDS on a graph-only recall: the user's own
     #      federated read set. Session history stays bound to ONE dataset, so
@@ -4329,13 +4333,16 @@ def recall_via_http(
     #      parent-owned dataset plus readable same-named copies): a name only
     #      resolves among datasets the caller OWNS, which under a plugin
     #      identity is not the dataset the agent was granted.
-    #   3. The dataset itself: sent as an id when UUID-shaped, else by name.
-    fields, federated = recall_fields(dataset, scope)
+    #   3. The (routed) dataset itself: sent as an id when UUID-shaped, else
+    #      by name.
+    fields, federated = recall_fields(write_dataset, scope)
     ids = [str(x).strip() for x in (dataset_ids or []) if str(x).strip()]
     if federated:
         payload.update(fields)
         payload.pop("session_id", None)
-    elif ids:
+    elif ids and write_dataset == dataset:
+        # Shared-memory ids describe the primary dataset; a companion-routed
+        # session is addressed by its routed name instead.
         payload["dataset_ids"] = ids
     else:
         payload.update(fields)
@@ -4343,18 +4350,12 @@ def recall_via_http(
         payload["search_type"] = search_type
     if context_profile:
         payload["context_profile"] = context_profile
-    from _deadlines import bounded_call
-    from _project_memory import route
-
-    target = route(dataset, session_id) if dataset and not code_query else {"write": dataset}
-    if dataset:
-        payload["datasets"] = [target["write"]]
 
     def fetch_scopes():
         started = time.monotonic()
         result = _json_http_request("/api/v1/recall", payload, timeout=timeout)
         result = result if isinstance(result, list) else []
-        if dataset != target["write"] and "graph" in scope:
+        if dataset != write_dataset and "graph" in scope:
             remaining = timeout - (time.monotonic() - started)
             if remaining > 0.05:
                 primary_payload = {**payload, "datasets": [dataset], "scope": ["graph"]}

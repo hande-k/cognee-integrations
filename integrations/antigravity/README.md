@@ -53,6 +53,26 @@ export COGNEE_ANTIGRAVITY_BACKEND=local  # or cloud
 This plugin-specific switch takes precedence over the shared `COGNEE_BACKEND`
 switch and does not change the configuration used by other Cognee plugins.
 
+## Plugin identity and shared agent memory
+
+Antigravity follows the same identity model as the Claude Code and Codex plugins:
+
+- `COGNEE_PLUGIN_IDENTITY` — `auto` (default) provisions a dedicated agent identity only
+  in service of shared agent memory and falls back to your principal key when that
+  cannot be wired; `true` requires an identity (create-only, never rotating a key
+  another machine holds) and never falls back to the owner; `false` runs as the
+  principal. The server's plugin registry must list `antigravity` for provisioning to
+  succeed; until it does, `auto` stays on the principal.
+- `COGNEE_SHARED_AGENT_MEMORY` — on by default: every plugin agent of your user joins
+  one `cognee-agent` role with read+write on your datasets, and the launch's dataset is
+  addressed by its canonical UUID, so Antigravity recalls what Claude Code and Codex
+  stored and vice versa. `false` gives separated, per-plugin memory (the agent leaves
+  the shared role). See the Claude Code plugin README for the full description.
+- `COGNEE_PLUGIN_READ_DATASET_IDS` — a JSON array of dataset UUIDs for federated graph
+  recall; session history stays scoped to its own dataset.
+
+The doctor shows the effective state under **API Key Source** and **Memory Sharing**.
+
 ## Data and state boundaries
 
 Private Antigravity hook state—logs, once markers, session maps, pending writes,

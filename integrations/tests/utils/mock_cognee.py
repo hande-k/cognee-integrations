@@ -264,7 +264,7 @@ class MockCogneeServer:
 
         # plugin identity provisioning (per-plugin agent sub-user + key).
         # Exact-path routing, so each known plugin key gets its own route.
-        for plugin_key in ("claude-code", "codex"):
+        for plugin_key in ("claude-code", "codex", "antigravity"):
             route(
                 f"/api/v1/integrations/plugins/{plugin_key}/provision",
                 "POST",

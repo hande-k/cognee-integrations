@@ -1036,8 +1036,16 @@ async def _ensure_agent_credentials_and_register(
         config["api_key"] = api_key
         user_id = await _user_id_via_api(service_url, api_key)
         registered, registration = _register()
-    if not registered:
-        raise RuntimeError(f"Failed to register session '{session_id}' on {service_url}.")
+    # Optional lifecycle routes (older / minimal servers, lifecycle_supported is
+    # False): the session runs unregistered rather than failing. Anything else
+    # is a real failure on a server that has the route — raise with the HTTP
+    # status so the caller can classify it (auth vs server error).
+    if not registered and registration.get("lifecycle_supported") is not False:
+        status = registration.get("status_code")
+        message = f"Failed to register session '{session_id}' on {service_url}."
+        if status:
+            raise urllib.error.HTTPError(service_url, status, message, None, None)
+        raise RuntimeError(message)
 
     hook_log(
         "agent_register_result",
