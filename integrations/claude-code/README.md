@@ -43,7 +43,7 @@ EOF
 chmod 600 ~/.cognee/.env
 ```
 
-> Cloud mode is a pure thin client: it talks to your remote server over HTTP only and does **not** install a local Cognee runtime. The bundled virtualenv (`~/.cognee-plugin/venv`) is built only in local mode, where an in-process server actually runs.
+> The plugin is an HTTP client in both modes; the hooks never import cognee in-process. Cloud mode does **not** install a local Cognee runtime. The bundled virtualenv (`~/.cognee-plugin/venv`) is built only in local mode, where it runs the local Cognee server the hooks talk to.
 
 **Local mode** (default when `COGNEE_BASE_URL` is not set) — the plugin bootstraps a local Cognee API at `http://localhost:8011`. Only `LLM_API_KEY` is required; `COGNEE_API_KEY` is auto-minted if absent:
 
@@ -117,10 +117,10 @@ At startup (`SessionStart`):
 A forced-local switch also scrubs `COGNEE_BASE_URL`/`COGNEE_API_KEY` from the process environment, so the per-prompt recall/remember calls and every spawned worker resolve the same local endpoint — not just `SessionStart`. A forced-cloud switch with no URL configured never boots the local server; the connection attempt fails visibly instead (status line + doctor).
 
 At hook runtime:
-- hooks resolve mode through runtime endpoint auth (env + `api_key.json`), not only config intent
-- `http` mode skips local SDK initialization
+- hooks resolve the endpoint through runtime endpoint auth (env + `api_key.json`), not only config intent
+- every hook talks to that endpoint over HTTP; there is no in-process (SDK) fallback
 
-The hooks emit `mode_decision` logs with `mode`, `service_url`, `url_source`, `key_source`, `api_key_present`.
+The hooks emit `mode_decision` logs with `mode` (always `http`), `service_url`, `url_source`, `key_source`, `api_key_present`.
 
 ## Sessions
 

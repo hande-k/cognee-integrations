@@ -162,7 +162,6 @@ def test_config_no_switch_cloud_wins(config_mod, monkeypatch):
     monkeypatch.setenv("LLM_API_KEY", "sk")
     cfg = config_mod.load_config()
     assert config_mod.is_cloud_mode(cfg)
-    assert not config_mod.is_local_mode(cfg)
 
 
 def test_config_forced_local_despite_cloud_vars(config_mod, monkeypatch):
@@ -172,7 +171,6 @@ def test_config_forced_local_despite_cloud_vars(config_mod, monkeypatch):
     monkeypatch.setenv("COGNEE_BACKEND", "local")
     cfg = config_mod.load_config()
     assert not config_mod.is_cloud_mode(cfg)
-    assert config_mod.is_local_mode(cfg)
     assert cfg["base_url"] == ""
     assert cfg["api_key"] == ""
     assert cfg["llm_api_key"] == "sk"
@@ -184,7 +182,6 @@ def test_config_forced_cloud_is_pinned_without_a_url(config_mod, monkeypatch):
     monkeypatch.setenv("COGNEE_BACKEND", "cloud")
     cfg = config_mod.load_config()
     assert config_mod.is_cloud_mode(cfg)
-    assert not config_mod.is_local_mode(cfg)
     assert cfg["base_url"] == ""
 
 

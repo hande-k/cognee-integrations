@@ -21,10 +21,9 @@ is_cloud_mode() true even when connection vars are missing, so the plugin
 attempts the cloud connection and the status line reports what is wrong
 instead of silently falling back to local.
 
-Supports three modes:
-  - Local: Cognee runs in-process (SQLite + LanceDB + Kuzu)
-  - Cloud: Connect to Cognee Cloud via cognee.serve()
-  - Server: Legacy — direct base_url (kept for backward compat)
+Two modes, both over HTTP — the hooks never import cognee in-process:
+  - Local: the plugin boots a Cognee server on localhost and talks to it
+  - Cloud: connect to a remote Cognee server via COGNEE_BASE_URL + COGNEE_API_KEY
 """
 
 import json
@@ -187,37 +186,6 @@ def is_cloud_mode(config: dict) -> bool:
     return bool(config.get("base_url")) or config.get("_forced_backend") == "cloud"
 
 
-def is_local_mode(config: dict) -> bool:
-    """Check if local mode (has LLM key, no cloud URL)."""
-    return bool(config.get("llm_api_key")) and not is_cloud_mode(config)
-
-
-async def ensure_identity(config: dict):
-    """Resolve the single Cognee principal for this session.
-
-    Single-principal model: there are no per-agent users and no per-agent API
-    keys. Authentication is the user-provided ``COGNEE_API_KEY`` (or a key minted
-    once from the default user — handled in session-start's registration path).
-
-    In cloud/server mode the API key already lives in the environment/cache, so
-    here we only resolve the principal's user id (best-effort) for dataset
-    readiness and watchers. In local SDK mode we resolve the default user.
-
-    Returns (user_id, api_key) tuple. api_key may be empty in local mode.
-    """
-    service_url = config.get("base_url", "")
-
-    if service_url:
-        from _plugin_common import _api_key
-
-        api_key = _api_key()
-        user_id = await _user_id_via_api(service_url, api_key) if api_key else ""
-        return user_id, api_key
-    else:
-        user_id = await _ensure_identity_via_sdk()
-        return user_id, ""
-
-
 def _cloud_http_request(
     url: str,
     *,
@@ -288,11 +256,10 @@ async def _user_id_via_api(service_url: str, api_key: str) -> str:
 
 
 async def ensure_dataset_ready_via_api(service_url: str, api_key: str, dataset: str) -> None:
-    """Ensure the remote backend has the dataset for the authenticated agent.
+    """Ensure the backend has the dataset for the authenticated agent.
 
-    This mirrors local SDK mode's ``ensure_dataset_ready(dataset, user)``:
-    the backend creates or returns the dataset and grants permissions to
-    the API-key user.
+    The backend creates or returns the dataset and grants permissions to the
+    API-key user.
     """
     if not service_url or not api_key or not dataset:
         return
@@ -310,132 +277,19 @@ async def ensure_dataset_ready_via_api(service_url: str, api_key: str, dataset: 
     raise RuntimeError(f"remote dataset ensure failed ({status}: {text[:200]})")
 
 
-async def _ensure_identity_via_sdk() -> str:
-    """Resolve the default user via the SDK (local mode, no backend).
-
-    Single-principal model: no agent user is created — the default user is the
-    one principal that owns all sessions/data in local mode.
-    """
-    from cognee.modules.users.methods import get_default_user
-
-    try:
-        user = await get_default_user()
-        if user:
-            return str(user.id)
-    except Exception as exc:
-        _config_log("default_user_resolve_failed", {"error": str(exc)[:200]})
-    return ""
-
-
-_LOCAL_SETUP_DONE = False
-
-
-async def _ensure_local_databases() -> None:
-    """Create Cognee's local relational/vector stores for SDK mode."""
-    global _LOCAL_SETUP_DONE
-    if _LOCAL_SETUP_DONE:
-        return
-
-    from cognee.modules.engine.operations.setup import setup
-
-    await setup()
-    _LOCAL_SETUP_DONE = True
-
-
 async def ensure_cognee_ready(config: dict) -> None:
-    """Configure cognee for the active mode (cloud or local).
+    """Confirm the configured server answers ``/health``.
 
-    In local SDK mode, also runs Cognee's setup() so a fresh machine or
-    fresh virtualenv has its databases/tables before identity, recall, or
-    session writes touch them.
+    Raises on an HTTP error status so callers can classify the connection
+    state. There is no in-process fallback: the hooks are HTTP clients only.
     """
-    if is_cloud_mode(config):
-        url = config["base_url"]
-        status, text = _cloud_http_request(f"{url.rstrip('/')}/health", timeout=10.0)
-        if status >= 400:
-            raise RuntimeError(f"backend health check failed ({status}: {text[:200]})")
-        print(f"cognee-plugin: connected to {url}", file=sys.stderr)
-        return
-
-    import cognee
-
-    if config.get("llm_api_key"):
-        cognee.config.set_llm_api_key(config["llm_api_key"])
-    if config.get("llm_model"):
-        cognee.config.set_llm_model(config["llm_model"])
-
-    await _ensure_local_databases()
-    print("cognee-plugin: local databases ready", file=sys.stderr)
-
-
-async def ensure_dataset_ready(dataset: str, user) -> None:
-    """Ensure the user can write to the dataset before session bridging.
-
-    On a fresh local install, session bridging can run before the dataset
-    has been created, causing persistence to no-op with permission
-    errors. Use Cognee's own pipeline resolver so dataset creation and
-    ACL grants follow the SDK's normal path.
-
-    Cognee 1.0.8's session/trace persistence pipelines call memify()
-    without forwarding their user argument. In local plugin processes,
-    make the resolved agent the process-local default user too, so those
-    nested calls resolve the same write permissions.
-    """
-    from cognee.base_config import get_base_config
-    from cognee.modules.pipelines.layers.resolve_authorized_user_datasets import (
-        resolve_authorized_user_datasets,
-    )
-
-    email = getattr(user, "email", "")
-    if email:
-        get_base_config().default_user_email = email
-
-    await resolve_authorized_user_datasets(dataset, user=user)
-
-
-async def improve_session_local(
-    dataset: str, session_id: str, user, *, trigger: str = "final"
-) -> dict:
-    """Bridge one session into the graph via the SDK's session-aware improve.
-
-    ``cognee.improve(session_ids=[...])`` reads the session cache itself and
-    runs feedback weights, QA persist, trace-feedback persist (the compact
-    per-step feedback lines — not raw tool output), distillation, enrichment,
-    and (in foreground mode) the graph→session sync. A cognee without it is
-    reported as ``unsupported`` — there is no client-side fallback (the old
-    persist path re-cognified the whole session cache on every run).
-    ``trigger`` names the caller and is recorded with the session's improve
-    state on success, for the idle/auto cooldown.
-
-    Serialized per session by ``improve_session_lock``, matching the HTTP path in
-    ``run_session_improve``. ``store-to-session``'s background fire takes no outer
-    ``sync_lock``, so without this the local path could double-submit one session
-    and have two writers contend for the single-writer graph store.
-    """
-    if not session_id or not user:
-        return {"ok": False, "error": "missing session/user"}
-
-    import cognee
-    from _plugin_common import improve_session_lock, record_improve_success
-
-    with improve_session_lock(session_id, "improve_session_local") as claimed:
-        if not claimed:
-            # Winner is already bridging this session; not dropped, just in flight.
-            return {"ok": False, "skipped": "concurrent"}
-        try:
-            result = await cognee.improve(
-                dataset,
-                session_ids=[session_id],
-                user=user,
-                run_in_background=False,
-            )
-        except TypeError as exc:
-            # cognee without session-aware improve. Not worked around: the old
-            # persist fallback re-cognified the whole session cache every run.
-            _config_log("improve_local_unsupported", {"error": str(exc)[:200]})
-            return {"ok": False, "unsupported": True, "error": str(exc)[:200]}
-        record_improve_success(session_id, dataset, trigger)
-        return {"ok": True, "result": result}
+    url = str(config.get("base_url") or "").strip()
+    if not url:
+        raise RuntimeError("no Cognee server URL configured")
+    status, text = _cloud_http_request(f"{url.rstrip('/')}/health", timeout=10.0)
+    if status >= 400:
+        raise RuntimeError(f"backend health check failed ({status}: {text[:200]})")
+    print(f"cognee-plugin: connected to {url}", file=sys.stderr)
 
 
 def _get_git_branch(cwd: str) -> str:

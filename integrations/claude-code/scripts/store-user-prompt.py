@@ -31,14 +31,12 @@ from _plugin_common import (
     remember_pending_prompt,
     resolve_runtime_mode,
     resolve_session_key_from_payload,
-    resolve_user,
-    server_ready_hint,
     server_usable,
     set_session_key,
     touch_activity,
 )
 from _proc import pid_alive
-from config import ensure_cognee_ready, get_dataset, get_session_id, load_config
+from config import get_dataset, get_session_id, load_config
 
 MAX_TEXT = 4000
 _STATE_DIR = Path.home() / ".cognee-plugin" / "claude-code"
@@ -159,16 +157,6 @@ async def _store(prompt: str, payload: dict):
             "api_key_present": runtime.get("api_key_present", False),
         },
     )
-    if runtime["mode"] == "local_sdk" and server_ready_hint(runtime.get("base_url", "")):
-        # Keep Cognee initialization parity with Claude so fresh local
-        # databases, identities, and datasets are ready before Stop writes.
-        # Skipped while the server is still warming so this hook never blocks;
-        # the prompt is still buffered below and flushed once the server is up.
-        try:
-            await ensure_cognee_ready(config)
-            await resolve_user(user_id)
-        except Exception as exc:
-            hook_log("prompt_prepare_warning", {"error": str(exc)[:200]})
 
     # Round-trip through utf-8 with errors="replace": prompts pasted from
     # transcripts can carry lone surrogates, and one stored surrogate 500s

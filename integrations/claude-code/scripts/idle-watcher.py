@@ -20,7 +20,6 @@ import os
 import signal
 import sys
 import time
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional
 
@@ -92,75 +91,39 @@ def _install_signal_handlers() -> None:
 
 
 async def _improve_once(session_id: str, dataset: str, config: dict) -> bool:
-    """Fire one session improve cycle. Returns True on success."""
+    """Fire one session improve cycle over HTTP. Returns True on success.
+
+    The server bridges the session from its own cache (``run_session_improve``)
+    and serializes per session itself, so no cross-hook file lock is needed
+    here. Without server auth there is nothing to submit to; the session-end
+    sync covers the session once a key is available.
+    """
     sys.path.insert(0, os.path.dirname(__file__))
     try:
         from _plugin_common import (  # type: ignore
             http_api_ready,
-            load_resolved,
-            resolve_user,
             run_session_improve,
             set_session_key,
-            sync_lock,
         )
 
         session_key = str(config.get("session_key") or "").strip()
         if session_key:
             set_session_key(session_key)
-        api_mode = http_api_ready()
-        # Server-side improve has its own per-session lock; only local SDK
-        # mode needs the cross-hook file lock.
-        lock = nullcontext(True) if api_mode else sync_lock("idle-watcher")
+        if not http_api_ready():
+            _log("bridge_skipped_no_auth", session=session_id, dataset=dataset)
+            return False
+        wrote = run_session_improve(dataset, session_id, trigger="idle")
+        _log(
+            "session_bridge_done",
+            session=session_id,
+            dataset=dataset,
+            via="http_improve",
+            wrote=wrote,
+        )
+        return True
     except Exception as exc:
-        _log("sync_lock_import_error", error=str(exc)[:200])
-        api_mode = False
-        lock = nullcontext(True)
-
-    with lock as acquired:
-        if not acquired:
-            _log("bridge_skipped_lock_busy", session=session_id, dataset=dataset)
-            return False
-
-        try:
-            from config import (  # type: ignore
-                ensure_cognee_ready,
-                ensure_dataset_ready,
-                ensure_identity,
-                improve_session_local,
-            )
-
-            if api_mode:
-                wrote = run_session_improve(dataset, session_id, trigger="idle")
-                _log(
-                    "session_bridge_done",
-                    session=session_id,
-                    dataset=dataset,
-                    via="http_improve",
-                    wrote=wrote,
-                )
-                return True
-
-            await ensure_cognee_ready(config)
-            user_id = str(config.get("user_id") or load_resolved().get("user_id") or "")
-            if not user_id:
-                user_id, _ = await ensure_identity(config)
-
-            user = await resolve_user(user_id) if user_id else None
-            if user:
-                await ensure_dataset_ready(dataset, user)
-                result = await improve_session_local(dataset, session_id, user, trigger="idle")
-                _log(
-                    "session_bridge_done",
-                    session=session_id,
-                    dataset=dataset,
-                    user_id=str(user.id),
-                    via="local_improve",
-                    ok=bool(result.get("ok")),
-                )
-            return True
-        except Exception as exc:
-            _log("bridge_error", error=str(exc)[:300])
-            return False
+        _log("bridge_error", error=str(exc)[:300])
+        return False
 
 
 def _run_update_check() -> None:
