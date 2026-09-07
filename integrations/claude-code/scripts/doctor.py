@@ -134,6 +134,40 @@ def _resolve_api_key_source() -> str:
     return label
 
 
+def _resolve_memory_sharing() -> str:
+    """How this plugin's memory relates to the user's other agents.
+
+    ``shared (role: cognee-agent)`` when the agent is wired into the shared
+    role; otherwise ``separated`` with the reason: the user opted out, the
+    plugin runs as the principal (no agent identity — the principal sees
+    everything anyway), or the wiring was skipped (older server, not the
+    tenant owner, tenant-less install that already owns data).
+    """
+    from _plugin_common import (
+        AGENT_ROLE_NAME,
+        load_cached_agent_key,
+        load_shared_memory_marker,
+        shared_memory_enabled,
+    )
+
+    if not shared_memory_enabled():
+        return "separated (opt-out)"
+    marker = load_shared_memory_marker()
+    if not load_cached_agent_key():
+        # An existing install that could not be wired stays on the principal;
+        # say why, so "no agent identity" is not mistaken for a broken install.
+        reason = str(marker.get("reason") or "").replace("_", " ")
+        return (
+            f"principal (shared memory unavailable: {reason})"
+            if reason
+            else ("principal (no agent identity)")
+        )
+    if marker.get("mode") == "shared":
+        return f"shared (role: {AGENT_ROLE_NAME})"
+    reason = str(marker.get("reason") or "not wired yet").replace("_", " ")
+    return f"separated ({reason})"
+
+
 def _check_health(server_url: str, timeout: float = 5.0) -> dict:
     """Probe GET /health and return reachability + latency.
 
@@ -220,6 +254,7 @@ def collect_report() -> dict:
     mode = _resolve_mode()
     display_url, raw_url = _resolve_server_url()
     api_key_source = _resolve_api_key_source()
+    memory_sharing = _resolve_memory_sharing()
     health = _check_health(raw_url)
     cognee_server = _resolve_server_version(health["raw_body"])
     cognee_local = _resolve_local_cognee_version()
@@ -231,6 +266,7 @@ def collect_report() -> dict:
         "env_file": _resolve_env_file(),
         "server_url": display_url if display_url != "-" else None,
         "api_key_source": api_key_source,
+        "memory_sharing": memory_sharing,
         "reachable": health["reachable"],
         "latency_ms": health["latency_ms"],
         "cognee_local": cognee_local,
@@ -246,6 +282,7 @@ _DISPLAY_ORDER = [
     ("Env File", "env_file"),
     ("Server URL", "server_url"),
     ("API Key Source", "api_key_source"),
+    ("Memory Sharing", "memory_sharing"),
     ("Reachable", "reachable"),
     ("Latency", "latency_ms"),
     ("Cognee (local)", "cognee_local"),

@@ -241,6 +241,27 @@ class MockCogneeServer:
                 "POST",
                 self._plugins_provision,
             )
+            route(
+                f"/api/v1/integrations/plugins/{plugin_key}",
+                "DELETE",
+                self._plugins_disconnect,
+            )
+
+        # permissions (shared agent memory: tenants, roles, dataset grants).
+        # Fixed paths first — pytest-httpserver matches in registration order.
+        route("/api/v1/permissions/tenants/me", "GET", self._tenants_me)
+        route("/api/v1/permissions/tenants/select", "POST", self._tenant_select)
+        route("/api/v1/permissions/tenants", "POST", self._tenants_create)
+        route(re.compile(r"^/api/v1/permissions/tenants/[^/]+/roles$"), "GET", self._tenant_roles)
+        route("/api/v1/permissions/roles", "POST", self._roles_create)
+        route(
+            re.compile(r"^/api/v1/permissions/users/[^/]+/tenants$"), "POST", self._tenant_add_user
+        )
+        route(re.compile(r"^/api/v1/permissions/users/[^/]+/roles$"), "POST", self._role_add_user)
+        route(
+            re.compile(r"^/api/v1/permissions/users/[^/]+/roles$"), "DELETE", self._role_remove_user
+        )
+        route(re.compile(r"^/api/v1/permissions/datasets/[^/]+$"), "POST", self._grant_datasets)
 
         # memory
         route("/api/v1/remember", "POST", self._remember)
@@ -317,12 +338,32 @@ class MockCogneeServer:
         status, body = self.identity.plugins_provision(plugin_key, req.headers.get("X-Api-Key"))
         return _json(status, body)
 
+    def _plugins_disconnect(self, req: Request) -> Response:
+        self._record(req)
+        # DELETE /api/v1/integrations/plugins/{plugin_key}
+        plugin_key = req.path.rstrip("/").split("/")[-1]
+        status, body = self.identity.plugins_disconnect(plugin_key, req.headers.get("X-Api-Key"))
+        return _json(status, body)
+
     def _remember(self, req: Request) -> Response:
         self._record(req)
         # Background remember returns an enqueue handle the client may poll
-        # via /api/v1/datasets/status.
+        # via /api/v1/datasets/status. ``datasetId`` addresses an existing
+        # dataset the caller must hold "write" on (shared-memory path);
+        # ``datasetName`` creates-or-gets the caller's own dataset by name.
+        api_key = req.headers.get("X-Api-Key")
+        dataset_id = req.form.get("datasetId", "")
+        if dataset_id:
+            caller = self.identity.user_id_for_key(api_key)
+            if dataset_id not in self.identity.dataset_rows:
+                return _json(404, {"detail": "Dataset not found"})
+            if caller and dataset_id not in self.identity.writable_dataset_ids(caller):
+                return _json(403, {"detail": "no write permission on dataset"})
+            return _json(
+                200, {"dataset_id": dataset_id, "pipeline_run_id": f"run-{len(self.calls)}"}
+            )
         dataset = req.form.get("datasetName", "")
-        _, ds = self.identity.datasets_create(dataset or "default")
+        _, ds = self.identity.datasets_create(dataset or "default", api_key)
         return _json(
             200,
             {"dataset_id": ds["id"], "pipeline_run_id": f"run-{len(self.calls)}"},
@@ -334,8 +375,88 @@ class MockCogneeServer:
 
     def _recall(self, req: Request) -> Response:
         self._record(req)
+        # ``dataset_ids`` are authorised against the caller (the real server
+        # raises PermissionDenied for ids the caller cannot read) so a test can
+        # prove cross-agent recall really is permitted, not just requested.
+        body_in = req.get_json(silent=True) or {}
+        ids = [str(x) for x in (body_in.get("dataset_ids") or [])]
+        caller = self.identity.user_id_for_key(req.headers.get("X-Api-Key"))
+        if ids and caller:
+            readable = set(self.identity.readable_dataset_ids(caller))
+            if any(ds not in readable for ds in ids):
+                return _json(403, {"detail": "Request owner does not have permission: [read]"})
         # Response MUST be a top-level JSON array (both clients expect a list).
         return _json(200, self._recall_results)
+
+    def _tenants_me(self, req: Request) -> Response:
+        self._record(req)
+        return _json(*self.identity.tenants_me(req.headers.get("X-Api-Key")))
+
+    def _tenants_create(self, req: Request) -> Response:
+        self._record(req)
+        return _json(
+            *self.identity.tenants_create(
+                req.headers.get("X-Api-Key"), req.args.get("tenant_name", "")
+            )
+        )
+
+    def _tenant_select(self, req: Request) -> Response:
+        self._record(req)
+        body_in = req.get_json(silent=True) or {}
+        return _json(
+            *self.identity.tenant_select(req.headers.get("X-Api-Key"), body_in.get("tenant_id"))
+        )
+
+    def _tenant_roles(self, req: Request) -> Response:
+        self._record(req)
+        tenant_id = req.path.rstrip("/").split("/")[-2]
+        return _json(*self.identity.tenant_roles(req.headers.get("X-Api-Key"), tenant_id))
+
+    def _roles_create(self, req: Request) -> Response:
+        self._record(req)
+        return _json(
+            *self.identity.roles_create(req.headers.get("X-Api-Key"), req.args.get("role_name", ""))
+        )
+
+    def _tenant_add_user(self, req: Request) -> Response:
+        self._record(req)
+        target = req.path.rstrip("/").split("/")[-2]
+        return _json(
+            *self.identity.tenant_add_user(
+                req.headers.get("X-Api-Key"), target, req.args.get("tenant_id", "")
+            )
+        )
+
+    def _role_add_user(self, req: Request) -> Response:
+        self._record(req)
+        target = req.path.rstrip("/").split("/")[-2]
+        return _json(
+            *self.identity.role_add_user(
+                req.headers.get("X-Api-Key"), target, req.args.get("role_id", "")
+            )
+        )
+
+    def _role_remove_user(self, req: Request) -> Response:
+        self._record(req)
+        target = req.path.rstrip("/").split("/")[-2]
+        return _json(
+            *self.identity.role_remove_user(
+                req.headers.get("X-Api-Key"), target, req.args.get("role_id", "")
+            )
+        )
+
+    def _grant_datasets(self, req: Request) -> Response:
+        self._record(req)
+        principal = req.path.rstrip("/").split("/")[-1]
+        ids = req.get_json(silent=True) or []
+        return _json(
+            *self.identity.grant_datasets(
+                req.headers.get("X-Api-Key"),
+                principal,
+                [str(x) for x in ids] if isinstance(ids, list) else [],
+                req.args.get("permission_name", ""),
+            )
+        )
 
     def _improve(self, req: Request) -> Response:
         self._record(req)
@@ -349,7 +470,9 @@ class MockCogneeServer:
     def _datasets(self, req: Request) -> Response:
         self._record(req)
         body_in = req.get_json(silent=True) or {}
-        status, body = self.identity.datasets_create(body_in.get("name", "default"))
+        status, body = self.identity.datasets_create(
+            body_in.get("name", "default"), req.headers.get("X-Api-Key")
+        )
         return _json(status, body)
 
     def _datasets_list(self, req: Request) -> Response:
@@ -361,8 +484,12 @@ class MockCogneeServer:
         seed nothing and get the fixed ``set_datasets`` list instead.
         """
         self._record(req)
-        if self.identity.datasets:
-            status, body = self.identity.datasets_list()
+        # Identity-backed once anything permission-relevant exists: seeded
+        # datasets, or a provisioned plugin agent (shared memory lists datasets
+        # per caller BEFORE any dataset exists — the static list would hand it a
+        # phantom dataset nobody owns).
+        if self.identity.dataset_rows or self.identity.plugin_agents:
+            status, body = self.identity.datasets_list(req.headers.get("X-Api-Key"))
             return _json(status, body)
         return _json(200, self._static_datasets)
 

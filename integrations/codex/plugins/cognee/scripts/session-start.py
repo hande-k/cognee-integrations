@@ -783,6 +783,25 @@ async def _resolve_single_principal_key(service_url: str, config: dict) -> str:
     return api_key
 
 
+def _plugin_identity_opted_in(config: dict) -> bool:
+    return str(config.get("plugin_identity", "") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+# Shared-memory outcomes that no retry within this deployment can change: the
+# server predates the permissions API, the user is not the owner of its tenant,
+# or a tenant-less user already owns data (activating a tenant would hide it).
+# An existing install that hit one of these stays on the principal instead of
+# re-provisioning (= rotating, revoking other machines' keys) every launch.
+_STRUCTURAL_SHARED_MEMORY_FAILURES = frozenset(
+    {"unsupported", "not_tenant_owner", "tenantless_with_data"}
+)
+
+
 async def _ensure_plugin_identity(service_url: str, config: dict, principal_key: str) -> str:
     """Resolve the plugin's dedicated agent key, provisioning when appropriate.
 
@@ -793,19 +812,27 @@ async def _ensure_plugin_identity(service_url: str, config: dict, principal_key:
       - No agent key + fresh install (no principal existed before this
         bootstrap) -> provision: all data lives under the plugin identity from
         day one, auto-shared to the parent user.
-      - No agent key + existing install -> stay on the principal unless the
-        user opts in (``plugin_identity: true`` / COGNEE_PLUGIN_IDENTITY).
-        Switching silently would strand datasets the principal already owns:
-        the parent->agent share is one-directional (agent-created datasets are
-        shared up; parent-owned ones are NOT shared down).
+      - No agent key + existing install -> provision when shared agent memory
+        is on (the default): the shared role keeps every dataset the principal
+        owns reachable from the agent, so nothing is stranded. The caller
+        verifies that wiring actually succeeded and falls back to the
+        principal otherwise (see ``_ensure_agent_credentials_and_register``).
+        With shared memory off, stay on the principal unless the user opts in
+        (``plugin_identity: true`` / COGNEE_PLUGIN_IDENTITY): the parent->agent
+        share is one-directional, so switching silently would look like
+        memory loss.
 
     Returns the agent key, or "" when the plugin runs as the principal.
     """
     from _plugin_common import (
         hook_log,
         load_cached_agent_key,
+        load_cached_api_key,
+        load_shared_memory_marker,
         provision_plugin_agent_via_http,
         save_cached_agent_key,
+        save_cached_api_key,
+        shared_memory_enabled,
     )
 
     agent_key = load_cached_agent_key(service_url)
@@ -813,31 +840,76 @@ async def _ensure_plugin_identity(service_url: str, config: dict, principal_key:
         return agent_key
 
     fresh_install = bool(config.get("_fresh_install"))
-    opted_in = str(config.get("plugin_identity", "") or "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    opted_in = _plugin_identity_opted_in(config)
+    shared_migration = False
     if not (fresh_install or opted_in):
-        return ""
+        if not shared_memory_enabled(config):
+            return ""
+        prior = str(load_shared_memory_marker(service_url).get("reason") or "")
+        if prior in _STRUCTURAL_SHARED_MEMORY_FAILURES:
+            hook_log("plugin_provision_skipped", {"status": "shared_memory_" + prior})
+            return ""
+        shared_migration = True
 
     status, body = provision_plugin_agent_via_http(principal_key=principal_key)
     if status == "provisioned":
         agent_key = str(body.get("api_key") or "").strip()
         save_cached_agent_key(service_url, agent_key, str(body.get("agent_id") or ""))
+        # Keep the PRINCIPAL reachable for later control-plane work (grant
+        # backfills from the idle watcher, re-provisioning after a revoke): an
+        # env-provided key only lives in this process's environment, and the
+        # data plane stamps the agent key over it.
+        if not load_cached_api_key(service_url):
+            save_cached_api_key(service_url, principal_key)
+        config["_provisioned_now"] = True
         hook_log(
             "plugin_agent_provisioned",
             {
                 "agent_id": str(body.get("agent_id") or ""),
                 "created": bool(body.get("created")),
-                "reason": "fresh_install" if fresh_install else "opt_in",
+                "reason": "fresh_install"
+                if fresh_install
+                else ("shared_memory" if shared_migration else "opt_in"),
             },
         )
         return agent_key
 
     hook_log("plugin_provision_skipped", {"status": status})
     return ""
+
+
+def _wire_shared_memory(
+    service_url: str, config: dict, principal_key: str, agent_key: str, session_key: str
+) -> dict:
+    """Run the shared-memory wiring for the active agent and pin the launch's
+    canonical dataset ids. Returns ``ensure_shared_memory``'s outcome."""
+    from _plugin_common import (
+        ensure_shared_memory,
+        hook_log,
+        load_cached_agent_id,
+        set_launch_dataset_ids,
+    )
+
+    shared = ensure_shared_memory(
+        service_url=service_url,
+        principal_key=principal_key,
+        agent_key=agent_key,
+        agent_id=load_cached_agent_id(service_url),
+        dataset=str(config.get("dataset", "") or "").strip(),
+        allow_setup=True,
+        config=config,
+    )
+    set_launch_dataset_ids(session_key, shared["dataset_id"], shared["dataset_ids"])
+    hook_log(
+        "shared_memory_resolved",
+        {
+            "mode": shared["mode"],
+            "reason": shared["reason"],
+            "dataset_id": shared["dataset_id"],
+            "read_ids": len(shared["dataset_ids"]),
+        },
+    )
+    return shared
 
 
 async def _ensure_agent_credentials_and_register(
@@ -854,6 +926,7 @@ async def _ensure_agent_credentials_and_register(
         provision_plugin_agent_via_http,
         register_agent_via_http,
         save_cached_agent_key,
+        set_launch_dataset_ids,
     )
 
     # Fresh install = no identity of any kind existed before this bootstrap.
@@ -868,7 +941,41 @@ async def _ensure_agent_credentials_and_register(
     if not principal_key:
         return "", "", "", False
 
+    fresh_install = bool(config.get("_fresh_install"))
     agent_key = await _ensure_plugin_identity(service_url, config, principal_key)
+
+    # Shared agent memory: wire the agent into the user's shared role and pin
+    # the canonical dataset ids on the launch record. An EXISTING install was
+    # moved onto an agent identity only on the promise that shared memory keeps
+    # its principal-owned datasets reachable — if that wiring did not happen,
+    # honour the promise by staying on the principal (the agent key is dropped;
+    # a structural reason also stops the next launch from re-provisioning).
+    shared = {
+        "mode": "separated",
+        "reason": "no_agent_identity",
+        "dataset_id": "",
+        "dataset_ids": [],
+    }
+    if agent_key:
+        shared = _wire_shared_memory(service_url, config, principal_key, agent_key, session_key)
+        if (
+            shared["mode"] != "shared"
+            and config.get("_provisioned_now")
+            and not fresh_install
+            and not _plugin_identity_opted_in(config)
+        ):
+            hook_log(
+                "plugin_identity_reverted",
+                {"reason": shared["reason"], "detail": "shared memory unavailable"},
+            )
+            from _plugin_common import disconnect_plugin_agent_via_http
+
+            # Nobody will hold the key just minted: revoke it server-side (the
+            # agent user stays for a later, successful migration).
+            disconnect_plugin_agent_via_http(principal_key=principal_key)
+            clear_cached_agent_key()
+            agent_key = ""
+            set_launch_dataset_ids(session_key, "", [])
     api_key = agent_key or principal_key
 
     os.environ["COGNEE_API_KEY"] = api_key
@@ -879,13 +986,18 @@ async def _ensure_agent_credentials_and_register(
     # sub-user, which is exactly the user the data plane operates as.
     user_id = await _user_id_via_api(service_url, api_key)
 
-    # Registration is a lifecycle counter + connection registry under the
-    # effective identity. The connection handle IS the Cognee session id.
-    registered, registration = register_agent_via_http(
-        agent_session_name=agent_session_name,
-        session_id=session_id,
-        dataset_names=[str(config.get("dataset", "") or "").strip()],
-    )
+    def _register() -> tuple[bool, dict]:
+        # Registration is a lifecycle counter + connection registry under the
+        # effective identity. The connection handle IS the Cognee session id.
+        # Under shared memory the binding is the canonical dataset's UUID.
+        return register_agent_via_http(
+            agent_session_name=agent_session_name,
+            session_id=session_id,
+            dataset_names=[str(config.get("dataset", "") or "").strip()],
+            dataset_ids=[shared["dataset_id"]] if shared.get("dataset_id") else None,
+        )
+
+    registered, registration = _register()
     if not registered and registration.get("auth_failed") and agent_key:
         # The provisioned key was revoked out-of-band (dashboard disconnect or
         # a re-provision elsewhere rotated it). Re-provision once as the
@@ -896,9 +1008,19 @@ async def _ensure_agent_credentials_and_register(
             agent_key = str(body.get("api_key") or "").strip()
             save_cached_agent_key(service_url, agent_key, str(body.get("agent_id") or ""))
             api_key = agent_key
+            # Same agent user, so its role membership survived the revoke; this
+            # re-resolves the canonical dataset under the fresh key.
+            shared = _wire_shared_memory(service_url, config, principal_key, agent_key, session_key)
         else:
             agent_key = ""
             api_key = principal_key
+            shared = {
+                "mode": "separated",
+                "reason": "reprovision_failed",
+                "dataset_id": "",
+                "dataset_ids": [],
+            }
+            set_launch_dataset_ids(session_key, "", [])
         hook_log(
             "plugin_agent_rekeyed",
             {"recovered": bool(agent_key), "provision_status": status},
@@ -906,11 +1028,7 @@ async def _ensure_agent_credentials_and_register(
         os.environ["COGNEE_API_KEY"] = api_key
         config["api_key"] = api_key
         user_id = await _user_id_via_api(service_url, api_key)
-        registered, registration = register_agent_via_http(
-            agent_session_name=agent_session_name,
-            session_id=session_id,
-            dataset_names=[str(config.get("dataset", "") or "").strip()],
-        )
+        registered, registration = _register()
     if not registered:
         raise RuntimeError(f"Failed to register session '{session_id}' on {service_url}.")
 
@@ -1376,7 +1494,12 @@ async def _run_heavy(
         # from X-Api-Key), so dataset creation must NOT be gated on user_id —
         # servers without /users/me (e.g. cloud tenants) leave user_id empty
         # while auth works fine. Only the SDK branch below needs a User object.
-        if is_cloud_mode(config):
+        # Under shared memory the canonical dataset was already resolved (and
+        # created as the parent when absent) by the credential step; creating
+        # it here as the agent would fork an agent-owned copy of the same name.
+        from _plugin_common import resolve_active_dataset_ids
+
+        if is_cloud_mode(config) and not resolve_active_dataset_ids(session_key)[0]:
             await ensure_dataset_ready_via_api(
                 config.get("base_url", ""),
                 agent_api_key or config.get("api_key", ""),

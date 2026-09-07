@@ -67,6 +67,12 @@ _DEFAULTS = {
     # existing installs keep the principal key (their datasets are owned by it)
     # unless this opt-in is set.
     "plugin_identity": False,
+    # Shared agent memory: every plugin agent of this user joins one shared role
+    # (``cognee-agent``) with read+write on the user's datasets, and the launch's
+    # dataset is addressed by its canonical UUID — so Codex recalls what Claude
+    # Code stored and vice versa. Opt out with COGNEE_SHARED_AGENT_MEMORY=false
+    # for separated, per-plugin memory.
+    "shared_agent_memory": True,
 }
 
 
@@ -102,6 +108,7 @@ _ENV_MAP = {
     "COGNEE_BASE_URL": "base_url",
     "COGNEE_API_KEY": "api_key",
     "COGNEE_PLUGIN_IDENTITY": "plugin_identity",
+    "COGNEE_SHARED_AGENT_MEMORY": "shared_agent_memory",
     "COGNEE_USER_EMAIL": "user_email",
     "COGNEE_USER_PASSWORD": "user_password",
     "LLM_API_KEY": "llm_api_key",

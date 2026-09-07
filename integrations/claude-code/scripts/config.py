@@ -70,6 +70,12 @@ _DEFAULTS = {
     # existing installs keep the principal key (their datasets are owned by it)
     # unless this opt-in is set.
     "plugin_identity": False,
+    # Shared agent memory: every plugin agent of this user joins one shared role
+    # (``cognee-agent``) with read+write on the user's datasets, and the launch's
+    # dataset is addressed by its canonical UUID — so Claude Code recalls what
+    # Codex stored and vice versa. Opt out with COGNEE_SHARED_AGENT_MEMORY=false
+    # for separated, per-plugin memory.
+    "shared_agent_memory": True,
     # Background remember + cognify status polling. Remember runs in the background
     # (so a large cognify never holds one request open past the cloud's ~10-min
     # request ceiling); these tune how completion is polled afterwards.
@@ -118,6 +124,7 @@ _ENV_MAP = {
     "LLM_MODEL": "llm_model",
     "COGNEE_PREFER_MEMORY": "prefer_cognee_memory",
     "COGNEE_PLUGIN_IDENTITY": "plugin_identity",
+    "COGNEE_SHARED_AGENT_MEMORY": "shared_agent_memory",
     # Background remember + cognify polling (read at the call sites via _float_env;
     # registered here for config-file support and discoverability).
     "COGNEE_COGNIFY_POLL_INTERVAL": "cognify_poll_interval",

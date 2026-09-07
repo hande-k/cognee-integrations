@@ -43,6 +43,7 @@ from _plugin_common import (  # noqa: E402
     mint_switch_session_id,
     register_agent_via_http,
     resolve_host_key_outside_hook,
+    resolve_shared_dataset,
     resolved_http_endpoint_auth,
     set_session_key,
     switch_launch_record,
@@ -156,7 +157,7 @@ def _sync_current(host_key: str, session_id: str, dataset: str) -> None:
         )
 
 
-def _register_new(session_id: str, dataset: str) -> str:
+def _register_new(session_id: str, dataset: str, dataset_id: str = "") -> str:
     """Register the new session under a fresh connection handle; returns the handle.
 
     Fresh handle first, old one released after: the server's agent-mode count
@@ -164,7 +165,10 @@ def _register_new(session_id: str, dataset: str) -> str:
     """
     conn_uuid = _new_conn_uuid()
     ok, _ = register_agent_via_http(
-        agent_session_name=conn_uuid, session_id=session_id, dataset_names=[dataset]
+        agent_session_name=conn_uuid,
+        session_id=session_id,
+        dataset_names=[dataset],
+        dataset_ids=[dataset_id] if dataset_id else None,
     )
     if not ok:
         raise SwitchError(
@@ -174,7 +178,19 @@ def _register_new(session_id: str, dataset: str) -> str:
     return conn_uuid
 
 
-def _ensure_dataset(dataset: str) -> None:
+def _ensure_dataset(dataset: str) -> tuple[str, list[str]]:
+    """Make ``dataset`` exist for this launch; returns its ``(write_id, read_ids)``.
+
+    Under shared agent memory the target is resolved as the PARENT: the
+    canonical parent-owned dataset (created as the parent when absent) that
+    every agent writes to, granted to the shared role — creating it as the
+    agent would fork an agent-owned copy nobody else can see. Otherwise the
+    dataset is created for the effective identity by name, as before, and the
+    ids stay empty (name-addressed).
+    """
+    shared = resolve_shared_dataset(dataset)
+    if shared["mode"] == "shared" and shared["dataset_id"]:
+        return shared["dataset_id"], shared["dataset_ids"]
     service_url, api_key = resolved_http_endpoint_auth()
     try:
         asyncio.run(ensure_dataset_ready_via_api(service_url, api_key, dataset))
@@ -182,6 +198,7 @@ def _ensure_dataset(dataset: str) -> None:
         text = str(exc)
         code = EXIT_NOT_WRITABLE if any(s in text for s in ("401", "403", "404")) else EXIT_ERROR
         raise SwitchError(code, f"dataset {dataset!r} is not available to this principal ({text})")
+    return "", []
 
 
 def _restart_idle_watcher(host_key: str, session_id: str, dataset: str, user_id: str) -> None:
@@ -286,15 +303,23 @@ def _switch(host_key: str, rec: dict, target: str, *, force: bool) -> dict:
         sync_ok, sync_error = False, str(exc)
         hook_log("switch_sync_forced_past_failure", {"error": sync_error[:300]})
 
-    # 2. Make sure the dataset exists for this principal (idempotent).
-    _ensure_dataset(target)
+    # 2. Make sure the dataset exists for this principal (idempotent); under
+    #    shared memory this also resolves its canonical UUIDs.
+    write_id, read_ids = _ensure_dataset(target)
 
     # 3. Register the new session first (fresh handle) ...
     new_session = mint_switch_session_id(host_key)
-    new_conn = _register_new(new_session, target)
+    new_conn = _register_new(new_session, target, write_id)
 
     # 4. ... repoint the launch record (atomic) ...
-    switch_launch_record(host_key, session_id=new_session, dataset=target, conn_uuid=new_conn)
+    switch_launch_record(
+        host_key,
+        session_id=new_session,
+        dataset=target,
+        conn_uuid=new_conn,
+        dataset_id=write_id,
+        dataset_ids=read_ids,
+    )
 
     # 5. ... then release the old handle. Best-effort: a lingering active
     #    connection is harmless and the final unregister sweeps `touched`.

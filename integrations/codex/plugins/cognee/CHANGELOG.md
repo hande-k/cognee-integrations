@@ -21,16 +21,46 @@ project adheres to [Semantic Versioning](https://semver.org/).
   `~/.cognee-plugin/codex/agent_key.json` and outranks the env/cached principal
   for data-plane traffic; datasets the agent creates are auto-shared to the
   parent user.
-  - **Fresh installs provision automatically.** Existing installs deliberately
-    stay on the principal key — their datasets are owned by it, and the
-    parent→agent share is one-directional — unless opted in with
-    `"plugin_identity": true` in config.json or `COGNEE_PLUGIN_IDENTITY=true`.
+  - **Fresh installs provision automatically; existing installs migrate when
+    shared agent memory (below) can keep their data reachable.** With shared
+    memory opted out, existing installs stay on the principal key — their
+    datasets are owned by it, and the parent→agent share is one-directional —
+    unless opted in with `"plugin_identity": true` in config.json or
+    `COGNEE_PLUGIN_IDENTITY=true`.
   - **Rotation-aware:** the server rotates (and revokes) the key on every
     provision call, so a cached key is never re-provisioned; a key revoked
     out-of-band (dashboard disconnect) is detected via the auth-rejected
     registration, dropped, and re-provisioned once. Servers without the
     endpoint (404) fall back to the principal silently.
   - The doctor reports the new key source as **Plugin identity**.
+- **Shared agent memory (default): one memory across all of your plugin
+  agents.** A plugin identity is its own user, and cognee's grants flow
+  child→parent only — left alone, per-plugin identities would silo memory
+  (Codex could not recall what Claude Code stored). Session start now wires
+  the agent into a shared `cognee-agent` role in your tenant (created for a
+  tenant-less fresh install) with read+write on your datasets, backfilled on
+  every launch and every ~60s by the idle watcher so a dataset another plugin
+  creates shows up without a restart. The launch's dataset becomes a
+  canonical, user-owned dataset addressed by UUID (`dataset_id`/`dataset_ids`
+  on the launch record) — a name only resolves among datasets the caller owns,
+  which would fork an empty per-agent copy — and recall, remember, the
+  session-entry store, improve, the sync bridge and the skills all address it
+  that way; pre-existing same-named copies stay in the recall set.
+  - **Opt out** with `"shared_agent_memory": false` in config.json or
+    `COGNEE_SHARED_AGENT_MEMORY=false` for separated, per-plugin memory (the
+    previous behaviour, name-addressed). The agent is removed from the
+    shared role — it can no longer read or write your datasets — keeps its
+    identity, and starts writing to its own, private dataset; what it shared
+    before stays in your user's dataset (still yours, still visible in the
+    dashboard). Re-enabling puts it back into the same role and dataset.
+  - Degrades to separated memory — never fails a session — when the server
+    has no permissions API, when you are not the owner of your tenant, or when
+    a tenant-less user already owns datasets (activating a tenant would hide
+    them). An existing install that hits one of those stays on the principal.
+  - Every tenant/role/grant call runs as the *principal*: an agent key can
+    never widen its own access (server-enforced, owner-only).
+  - The doctor shows **Memory Sharing** (`shared (role: cognee-agent)` /
+    `separated (<reason>)` / `principal (no agent identity)`).
 
 ### Changed
 - **Agent connections now self-declare `type: "codex"`** at

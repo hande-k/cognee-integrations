@@ -166,13 +166,50 @@ def test_fresh_install_provisions_a_plugin_identity(suite, bootstrap, mock_serve
     mock_server.assert_called("POST", "/api/v1/agents/register", type=CONNECTION_TYPE[suite.name])
 
 
-def test_existing_install_stays_on_the_principal(suite, bootstrap, mock_server, monkeypatch):
-    """A pre-existing env key marks a non-fresh install: no silent migration."""
+def test_existing_install_stays_on_the_principal_with_separated_memory(
+    suite, bootstrap, mock_server, monkeypatch
+):
+    """A pre-existing env key marks a non-fresh install. With shared agent
+    memory opted out there is nothing to keep the principal's datasets
+    reachable from an agent, so no silent migration happens."""
     monkeypatch.setenv("COGNEE_API_KEY", PRINCIPAL_KEY)
+    monkeypatch.setenv("COGNEE_SHARED_AGENT_MEMORY", "false")
     module, run = bootstrap
     _user_id, api_key, _name, ok = run({"api_key": PRINCIPAL_KEY})
     assert ok
     assert api_key == PRINCIPAL_KEY
+    mock_server.assert_not_called("POST", PROVISION_PATH[suite.name])
+
+
+def test_existing_install_migrates_under_shared_memory(suite, bootstrap, mock_server, monkeypatch):
+    """Shared memory (the default) makes migration safe — the shared role keeps
+    every principal-owned dataset reachable — so an existing install moves onto
+    its plugin identity."""
+    monkeypatch.setenv("COGNEE_API_KEY", PRINCIPAL_KEY)
+    module, run = bootstrap
+    _user_id, api_key, _name, ok = run({"api_key": PRINCIPAL_KEY})
+    assert ok
+    assert api_key.startswith("agentkey-")
+    mock_server.assert_called("POST", PROVISION_PATH[suite.name])
+
+
+def test_existing_install_reverts_when_shared_memory_is_unavailable(
+    suite, bootstrap, mock_server, monkeypatch
+):
+    """The migration promise is 'nothing gets stranded'. When the server cannot
+    wire shared memory (here: no permissions API), an existing install drops the
+    freshly provisioned agent key and stays on the principal."""
+    monkeypatch.setenv("COGNEE_API_KEY", PRINCIPAL_KEY)
+    mock_server.identity.permissions_api = False
+    module, run = bootstrap
+    _user_id, api_key, _name, ok = run({"api_key": PRINCIPAL_KEY})
+    assert ok
+    assert api_key == PRINCIPAL_KEY
+    mock_server.assert_called("POST", PROVISION_PATH[suite.name])
+    # ...and the structural reason stops the next launch from provisioning again.
+    mock_server.calls.clear()
+    _user_id, api_key, _name, ok = run({"api_key": PRINCIPAL_KEY})
+    assert ok and api_key == PRINCIPAL_KEY
     mock_server.assert_not_called("POST", PROVISION_PATH[suite.name])
 
 

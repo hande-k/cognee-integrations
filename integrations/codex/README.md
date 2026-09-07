@@ -132,12 +132,43 @@ Key resolution order for data-plane traffic:
 
 Provisioning policy:
 - **Fresh installs** (no key of any kind yet) provision a plugin identity automatically.
-- **Existing installs** keep the principal key — your datasets are owned by it, and
-  switching identities would hide them from the plugin. Opt in explicitly with
-  `"plugin_identity": true` in `config.json` or `COGNEE_PLUGIN_IDENTITY=true`.
+- **Existing installs** provision too, *provided shared agent memory (below) can be
+  wired* — that is what keeps the datasets your user already owns reachable from the
+  new identity. If it cannot be (older server, not the tenant owner, tenant-less user
+  who already owns data), or if you opted out of shared memory, the plugin stays on
+  the principal key; opt in to a plugin identity anyway with `"plugin_identity": true`
+  in `config.json` or `COGNEE_PLUGIN_IDENTITY=true`.
 - A key revoked from the dashboard (disconnect / re-provision elsewhere) is detected
   at the next session start and re-provisioned once; servers without the endpoint
   fall back to the principal silently.
+
+### Shared agent memory
+
+A plugin identity is its own cognee user, and grants only flow child→parent: your user
+sees what the agent writes, but the agent sees nothing your user (or another plugin's
+agent) owns. Left alone, that would silo memory per plugin — Codex could not recall what
+Claude Code stored. **Shared agent memory, on by default, makes every plugin agent of
+your user share one memory:**
+
+- Session start ensures your user owns a tenant (one is created for a fresh, tenant-less
+  install) and a `cognee-agent` role in it, adds the agent to both, and grants the role
+  read+write on your datasets. Grants are backfilled on every session start and every
+  ~60 s by the idle watcher, so a dataset another plugin creates becomes visible here
+  without a restart.
+- The launch's dataset is a **canonical, user-owned dataset addressed by UUID** (the
+  launch record's `dataset_id` for writes, `dataset_ids` for recall — including any
+  same-named per-agent copies from before). Every hook and skill addresses it that way;
+  a plain name would only resolve among datasets the agent itself owns.
+- All tenant/role/grant calls run as your user, never as the agent — the server only
+  lets the tenant owner manage roles, so an agent key cannot widen its own access.
+
+Turn it off with `"shared_agent_memory": false` in `config.json` or
+`COGNEE_SHARED_AGENT_MEMORY=false` for separated, per-plugin memory (name-addressed,
+agent-owned datasets). Opting out removes the agent from the shared role — it can no
+longer read or write your datasets — and starts it on a private dataset; it does not move
+data, so what it shared before stays in your user's dataset. Re-enabling puts the agent
+back into the same role and dataset. The doctor shows the current state under
+**Memory Sharing**.
 
 ## Mode selection rules
 
