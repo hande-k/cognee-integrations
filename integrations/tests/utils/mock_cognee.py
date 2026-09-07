@@ -221,6 +221,35 @@ class MockCogneeServer:
         # health / reachability
         route("/health", "GET", self._health)
         route("/docs", "GET", self._docs)
+        route(
+            "/openapi.json",
+            "GET",
+            lambda req: _json(
+                200,
+                {
+                    "paths": {
+                        **(
+                            {
+                                "/api/v1/integrations/plugins/{plugin_key}/provision": {
+                                    "post": {"parameters": [{"name": "create_only", "in": "query"}]}
+                                }
+                            }
+                            if self.identity.plugin_provisioning
+                            else {}
+                        ),
+                        **(
+                            {
+                                "/api/v1/remember/entry": {
+                                    "post": {"x-cognee-session-dataset-ids": True}
+                                }
+                            }
+                            if self.identity.typed_dataset_ids
+                            else {}
+                        ),
+                    }
+                },
+            ),
+        )
 
         # auth + identity (single-principal-key flow)
         route("/api/v1/auth/login", "POST", self._login)
@@ -273,6 +302,18 @@ class MockCogneeServer:
         # POST across a 307.
         route(re.compile(r"^/api/v1/datasets/?$"), "POST", self._datasets)
         route("/api/v1/datasets", "GET", self._datasets_list)
+        route("/api/v1/datasets/", "GET", self._datasets_list)
+        route(
+            re.compile(r"/api/v1/permissions/principals/[^/]+/datasets"),
+            "GET",
+            # The real route lists a principal's DIRECT grants (no role expansion).
+            lambda req: _json(
+                200,
+                self.identity.principal_datasets(
+                    req.path.split("/")[-2], req.args.get("permission_name", "read")
+                ),
+            ),
+        )
         route("/api/v1/datasets/status", "GET", self._datasets_status)
 
         # forget surface (dataset inspection + deletion); the listing itself is
@@ -335,7 +376,11 @@ class MockCogneeServer:
         self._record(req)
         # /api/v1/integrations/plugins/{plugin_key}/provision
         plugin_key = req.path.rstrip("/").split("/")[-2]
-        status, body = self.identity.plugins_provision(plugin_key, req.headers.get("X-Api-Key"))
+        status, body = self.identity.plugins_provision(
+            plugin_key,
+            req.headers.get("X-Api-Key"),
+            create_only=req.args.get("create_only") == "true",
+        )
         return _json(status, body)
 
     def _plugins_disconnect(self, req: Request) -> Response:

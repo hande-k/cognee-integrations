@@ -199,9 +199,14 @@ def do_remember(
         except OSError as e:
             return _error(0, "cannot read %s: %s" % (file_path, str(e)[:160]))
         filename = os.path.basename(str(file_path).rstrip("/")) or filename
+    from _dataset_access import dataset_id as parse_dataset_id
+
+    # The explicit UUID (shared memory's canonical dataset) wins; otherwise a
+    # UUID-shaped dataset is sent as datasetId and a name as datasetName.
+    ident = str(dataset_id or "").strip() or parse_dataset_id(dataset)
     fields = {"node_set": node_set, "run_in_background": _background_flag()}
-    if str(dataset_id or "").strip():
-        fields["datasetId"] = str(dataset_id).strip()
+    if ident:
+        fields["datasetId"] = ident
     else:
         fields["datasetName"] = dataset
     body, boundary = _multipart_body(

@@ -145,7 +145,7 @@ def _resolve_memory_sharing() -> str:
     """
     from _plugin_common import (
         AGENT_ROLE_NAME,
-        load_cached_agent_key,
+        active_agent_key,
         load_shared_memory_marker,
         shared_memory_enabled,
     )
@@ -153,9 +153,10 @@ def _resolve_memory_sharing() -> str:
     if not shared_memory_enabled():
         return "separated (opt-out)"
     marker = load_shared_memory_marker()
-    if not load_cached_agent_key():
-        # An existing install that could not be wired stays on the principal;
-        # say why, so "no agent identity" is not mistaken for a broken install.
+    if not active_agent_key():
+        # An install that could not be wired (or whose identity is blocked or
+        # bound to another principal) runs as the principal; say why, so "no
+        # agent identity" is not mistaken for a broken install.
         reason = str(marker.get("reason") or "").replace("_", " ")
         return (
             f"principal (shared memory unavailable: {reason})"

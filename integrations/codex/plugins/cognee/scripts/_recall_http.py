@@ -218,11 +218,25 @@ def do_recall(
     # authenticated user or the server returns DatasetNotFoundError.
     # When dataset is empty (standalone invocation without shell), fall back to
     # the original search-all behaviour to avoid breaking direct callers.
+    from _dataset_access import recall_fields
+
+    # Precedence: COGNEE_PLUGIN_READ_DATASET_IDS on a graph-only recall (the
+    # user's own federated read set; session history stays bound to ONE
+    # dataset, so the session id is dropped), then the UUIDs shared memory
+    # resolved for the launch, then the dataset itself (id when UUID-shaped).
+    fields, federated = recall_fields(dataset, body["scope"])
     ids = coerce_dataset_ids(dataset_ids)
-    if ids:
+    if ids and body["scope"] != ["graph"]:
+        # Session history is bound to ONE dataset — the canonical write dataset,
+        # first in the resolved list; same-named copies only widen graph recall.
+        ids = ids[:1]
+    if federated:
+        body.update(fields)
+        body.pop("session_id", None)
+    elif ids:
         body["dataset_ids"] = ids
-    elif dataset:
-        body["datasets"] = [dataset]
+    else:
+        body.update(fields)
     if context_profile:
         body["context_profile"] = context_profile
     headers = {"Content-Type": "application/json"}

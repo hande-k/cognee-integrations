@@ -167,24 +167,32 @@ def test_agent_remember_entry_targets_the_canonical_dataset_id(pc, bootstrap, mo
     mock_server.assert_called("POST", "/api/v1/remember/entry", dataset_id=write_id)
 
 
-def test_existing_same_named_copies_stay_readable(pc, bootstrap, mock_server):
+def test_existing_same_named_copies_stay_readable(suite, pc, bootstrap, mock_server, monkeypatch):
     """Datasets forked under name addressing before shared memory (an agent's
     own ``agent_sessions``) are not lost: the parent's copy is canonical for
     writes, the agent-owned copy stays in the recall set."""
     ident = mock_server.identity
     parent_id = ident.principal_id
     parent_copy = ident.seed_dataset("agent_sessions", parent_id)
-    status, body = ident.plugins_provision("claude-code", PRINCIPAL_KEY)
+    # An identity this machine already holds (create-only provisioning would
+    # refuse a second key for an existing agent), with its own legacy copy.
+    status, body = ident.plugins_provision(suite.name, PRINCIPAL_KEY)
+    pc.save_cached_agent_key(
+        mock_server.url, body["apiKey"], body["agentId"], principal_key=PRINCIPAL_KEY
+    )
     legacy_copy = ident.seed_dataset("agent_sessions", body["agentId"])
 
     module, run = bootstrap
-    _uid, _key, _n, ok = run({"api_key": PRINCIPAL_KEY})
+    monkeypatch.setenv("COGNEE_API_KEY", PRINCIPAL_KEY)
+    _uid, api_key, _n, ok = run({"api_key": PRINCIPAL_KEY})
     # The principal already owns datasets AND has no tenant: shared memory must
-    # not activate a tenant over its head (that would hide every dataset).
-    assert ok
+    # not activate a tenant over its head (that would hide every dataset). The
+    # identity itself is kept — nothing was provisioned on this launch.
+    assert ok and api_key == body["apiKey"]
     marker = pc.load_shared_memory_marker(mock_server.url)
     assert marker.get("mode") == "separated"
     assert marker.get("reason") == "tenantless_with_data"
+    assert not ident.tenants
     del parent_copy, legacy_copy
 
 
@@ -204,14 +212,21 @@ def test_canonical_prefers_parent_copy_and_keeps_siblings_readable(pc, mock_serv
 
 
 def test_opt_out_keeps_separated_memory(suite, pc, bootstrap, mock_server, monkeypatch):
+    """Identity mode ``auto`` provisions only in service of shared memory: with
+    shared memory off the plugin runs as the principal — the pre-identity
+    behaviour. An identity is still available on explicit request."""
     monkeypatch.setenv("COGNEE_SHARED_AGENT_MEMORY", "false")
     module, run = bootstrap
     _uid, api_key, _n, ok = run({})
-    assert ok and api_key.startswith("agentkey-")  # fresh install still provisions
+    assert ok and not api_key.startswith("agentkey-")
+    mock_server.assert_not_called("POST", f"/api/v1/integrations/plugins/{suite.name}/provision")
     ident = mock_server.identity
     assert not ident.tenants and not ident.roles
-    # Name-addressed (no UUIDs pinned): the dataset is created by name for the
-    # agent later in the bootstrap — the pre-shared behaviour.
+    assert pc.resolve_active_dataset_ids("host-shared-1") == ("", [])
+    # Explicit identity + separated memory: a private, name-addressed agent.
+    _uid, api_key, _n, ok = run({"plugin_identity": True})
+    assert ok and api_key.startswith("agentkey-")
+    assert not ident.tenants and not ident.roles
     assert pc.resolve_active_dataset_ids("host-shared-1") == ("", [])
     assert pc.load_shared_memory_marker(mock_server.url) == {}
     for call in mock_server.calls:
@@ -224,13 +239,26 @@ def test_opt_out_keeps_separated_memory(suite, pc, bootstrap, mock_server, monke
     assert "dataset_id" not in entry["json"]
 
 
-def test_older_server_without_permissions_api_stays_separated(pc, bootstrap, mock_server):
+def test_older_server_without_permissions_api_stays_on_the_principal(
+    suite, pc, bootstrap, mock_server
+):
+    """Identity mode ``auto`` provisions only in service of shared memory. When
+    the server cannot host it (no permissions API), the freshly provisioned
+    identity is revoked again and the plugin stays on the principal — and the
+    structural reason stops the next launch from provisioning again."""
     mock_server.identity.permissions_api = False
     module, run = bootstrap
     _uid, api_key, _n, ok = run({})
-    assert ok and api_key.startswith("agentkey-")
+    assert ok and not api_key.startswith("agentkey-")
+    mock_server.assert_called("POST", f"/api/v1/integrations/plugins/{suite.name}/provision")
+    mock_server.assert_called("DELETE", f"/api/v1/integrations/plugins/{suite.name}")
     assert pc.load_shared_memory_marker(mock_server.url).get("reason") == "unsupported"
     assert pc.resolve_active_dataset_ids("host-shared-1") == ("", [])
+    assert pc.load_cached_agent_key(mock_server.url) == ""
+    mock_server.calls.clear()
+    _uid, api_key, _n, ok = run({})
+    assert ok and not api_key.startswith("agentkey-")
+    mock_server.assert_not_called("POST", f"/api/v1/integrations/plugins/{suite.name}/provision")
 
 
 def test_non_owner_of_an_org_tenant_stays_separated(pc, bootstrap, mock_server):
@@ -386,18 +414,23 @@ def test_opt_out_after_shared_use_is_consistent_and_reversible(
     mock_server.assert_not_called("POST", "/api/v1/permissions/roles")
 
 
-def test_tenantless_user_with_agent_owned_data_stays_separated(suite, pc, bootstrap, mock_server):
+def test_tenantless_user_with_agent_owned_data_stays_separated(
+    suite, pc, bootstrap, mock_server, monkeypatch
+):
     """An agent that already created datasets under name addressing (the
     pre-shared fresh-install path) must not be moved into a tenant: it would
     select that tenant and lose sight of its own tenant-less datasets."""
     ident = mock_server.identity
     _, body = ident.plugins_provision(suite.name, PRINCIPAL_KEY)
-    pc.save_cached_agent_key(mock_server.url, body["apiKey"], body["agentId"])
+    pc.save_cached_agent_key(
+        mock_server.url, body["apiKey"], body["agentId"], principal_key=PRINCIPAL_KEY
+    )
     ident.seed_dataset("agent_sessions", body["agentId"])  # auto-shared to the parent
     assert not any(r["ownerId"] == ident.principal_id for r in ident.dataset_rows.values())
 
     module, run = bootstrap
-    _uid, api_key, _n, ok = run({})
+    monkeypatch.setenv("COGNEE_API_KEY", PRINCIPAL_KEY)
+    _uid, api_key, _n, ok = run({"api_key": PRINCIPAL_KEY})
     assert ok and api_key == body["apiKey"]
     assert not ident.tenants
     assert pc.load_shared_memory_marker(mock_server.url).get("reason") == "tenantless_with_data"

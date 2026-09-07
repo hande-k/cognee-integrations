@@ -131,16 +131,26 @@ Key resolution order for data-plane traffic:
 4. Auto-mint from the default local user (local mode only), then cache to `api_key.json`
 
 Provisioning policy:
-- **Fresh installs** (no key of any kind yet) provision a plugin identity automatically.
-- **Existing installs** provision too, *provided shared agent memory (below) can be
-  wired* — that is what keeps the datasets your user already owns reachable from the
-  new identity. If it cannot be (older server, not the tenant owner, tenant-less user
-  who already owns data), or if you opted out of shared memory, the plugin stays on
-  the principal key; opt in to a plugin identity anyway with `"plugin_identity": true`
-  in `config.json` or `COGNEE_PLUGIN_IDENTITY=true`.
-- A key revoked from the dashboard (disconnect / re-provision elsewhere) is detected
-  at the next session start and re-provisioned once; servers without the endpoint
-  fall back to the principal silently.
+- `COGNEE_PLUGIN_IDENTITY` selects the identity policy:
+  - `auto` (default) — an identity **in service of shared agent memory** (below). When
+    shared memory is on, session start provisions one (create-only, never rotating a key
+    another machine holds), wires the shared role, and pins the canonical dataset; if that
+    wiring cannot be done (older server, not the tenant owner, tenant-less user who already
+    owns data) the plugin stays on the principal key and says why in the doctor output. With
+    shared memory off it stays on the principal.
+  - `true` — explicit identity: provisioning is required and never falls back to the owner.
+    Servers without the SDK's `create_only` capability, a cached credential bound to another
+    principal, or rejected credentials stop with an error instead of rotating keys or
+    silently using the owner's authority.
+  - `false` — principal mode; a cached identity is ignored.
+- A cached credential is bound to its server and principal. Under `auto`, a credential the
+  server rejected or that belongs to another account is not used and the plugin runs as
+  the principal (logged); under `true` that is an error, and reconnecting a revoked
+  identity requires explicit reconnection.
+- Use dataset UUIDs for shared write targets. Dataset switching checks effective write
+  permissions. Set `COGNEE_PLUGIN_READ_DATASET_IDS` to a JSON array of allowed UUIDs for
+  graph recall across datasets you granted yourself; it takes precedence over the datasets
+  shared memory resolved, and session history stays scoped to its own dataset.
 
 ### Shared agent memory
 
@@ -257,16 +267,18 @@ list and the session-end sync covers them again as a safety net. The script behi
 
 ## Session sync and watchers
 
-Session→graph sync runs through Cognee's session-aware `improve` endpoint: the server bridges the session from its own session cache (feedback weights, Q&A persist, compact trace-feedback persist, distillation, enrichment) instead of the plugin re-posting the full accumulated session text — which used to trigger a complete re-cognify of the whole transcript on every sync. Servers without session-aware improve automatically fall back to the legacy document bridge.
+Session→graph sync runs through Cognee's session-aware `improve` endpoint: the server bridges the session from its own session cache (feedback weights, Q&A persist, compact trace-feedback persist, distillation, enrichment) instead of the plugin re-posting the full accumulated session text — which used to trigger a complete re-cognify of the whole transcript on every sync. There is no fallback: a server without session-aware improve (`/api/v1/improve` answering 404/405/422) is logged as `improve_unsupported` and the session is reported as not synced.
 
-An idle watcher runs in the background for the lifetime of each launch. It polls activity every `COGNEE_IDLE_POLL` seconds and fires an improve when the session has been quiet for `COGNEE_IDLE_THRESHOLD` seconds, then waits at least `COGNEE_IMPROVE_COOLDOWN` seconds before the next run. An automatic improve also fires every `COGNEE_AUTO_IMPROVE_EVERY` stored tool calls/stops.
+An idle watcher runs in the background for the lifetime of each launch. It polls activity every `COGNEE_IDLE_POLL` seconds and fires an improve when the session has been quiet for `COGNEE_IDLE_THRESHOLD` seconds. An automatic improve also fires every `COGNEE_AUTO_IMPROVE_EVERY` stored tool calls/stops (`0` disables it).
+
+Both of those automatic triggers share one **per-session cooldown**: after any successful improve of a session (idle, auto, manual or final), no further idle/auto improve runs for `COGNEE_IMPROVE_COOLDOWN` seconds, and none runs at all until at least one new prompt, tool call or answer has been stored since. The timestamp and turn count are persisted per session under `~/.cognee-plugin/codex/improve-state/`, so they survive the watcher process, which exits after each bridge and is respawned on the next prompt. (Until 1.4.4 the cooldown lived only in that process's memory and was reset on every respawn, so in practice an improve ran after every prompt.) The session-end final sync, the `/cognee-memory:cognee-sync` skill and the dataset-switch sync ignore the cooldown and always run.
 
 | Env var | Default | Effect |
 |---|---|---|
 | `COGNEE_IDLE_POLL` | `10` | Poll interval in seconds |
 | `COGNEE_IDLE_THRESHOLD` | `60` | Seconds of inactivity before idle improve fires |
-| `COGNEE_IMPROVE_COOLDOWN` | `600` | Minimum seconds between idle improve runs |
-| `COGNEE_AUTO_IMPROVE_EVERY` | `150` | Stored tool calls/stops between automatic improves (0 disables) |
+| `COGNEE_IMPROVE_COOLDOWN` | `600` | Minimum seconds between automatic (idle/auto) improves of one session; persisted per session |
+| `COGNEE_AUTO_IMPROVE_EVERY` | `150` | Stored tool calls/stops between automatic improves (`0` disables) |
 | `COGNEE_IMPROVE_SUBMIT_TIMEOUT` | `180` | Read timeout for the improve POST (distillation runs inside the request) |
 | `COGNEE_IMPROVE_BUSY_DEADLINE` | `600` | How long to wait for a concurrent improve's session lock before giving up |
 | `COGNEE_IMPROVE_BUSY_RETRY_INTERVAL` | `15` | Seconds between re-submits while the session lock is held |
@@ -408,8 +420,8 @@ where a boot that failed before the server could open its own log explains itsel
 At every SessionStart the plugin also sweeps its own state directory: per-session
 files whose session is over (status markers, bridge caches and pending buffers
 untouched for a week; launch records a week after their host process died, or
-after 30 days), improve locks whose owner is gone, an expired
-`improve-unsupported.json`, and directories older versions left behind. It
+after 30 days), improve locks whose owner is gone, improve-state files
+untouched for a week, and directories older versions left behind. It
 never touches another plugin's subdirectory. One `state_sweep` line in
 `hook.log` records what was removed.
 
@@ -551,8 +563,8 @@ Keys are letters, digits, and underscores. Values are taken literally — no `$V
 | local LLM | `LLM_API_KEY`, `LLM_MODEL` | unset | Required for local mode runtime |
 | idle watcher poll | `COGNEE_IDLE_POLL` | `10` | Idle watcher poll interval in seconds |
 | idle watcher threshold | `COGNEE_IDLE_THRESHOLD` | `60` | Seconds of inactivity before idle improve fires |
-| idle watcher cooldown | `COGNEE_IMPROVE_COOLDOWN` | `600` | Minimum seconds between idle improve runs |
-| auto-improve threshold | `COGNEE_AUTO_IMPROVE_EVERY` | `150` | Stored tool calls/stops between automatic improves (0 disables) |
+| improve cooldown | `COGNEE_IMPROVE_COOLDOWN` | `600` | Minimum seconds between automatic (idle/auto) improves of one session |
+| auto-improve threshold | `COGNEE_AUTO_IMPROVE_EVERY` | `150` | Stored tool calls/stops between automatic improves (`0` disables) |
 | improve submit timeout | `COGNEE_IMPROVE_SUBMIT_TIMEOUT` | `180` | Read timeout for the improve POST |
 
 ## Troubleshooting

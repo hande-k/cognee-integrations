@@ -21,17 +21,20 @@ project adheres to [Semantic Versioning](https://semver.org/).
   `~/.cognee-plugin/codex/agent_key.json` and outranks the env/cached principal
   for data-plane traffic; datasets the agent creates are auto-shared to the
   parent user.
-  - **Fresh installs provision automatically; existing installs migrate when
-    shared agent memory (below) can keep their data reachable.** With shared
-    memory opted out, existing installs stay on the principal key — their
-    datasets are owned by it, and the parent→agent share is one-directional —
-    unless opted in with `"plugin_identity": true` in config.json or
-    `COGNEE_PLUGIN_IDENTITY=true`.
-  - **Rotation-aware:** the server rotates (and revokes) the key on every
-    provision call, so a cached key is never re-provisioned; a key revoked
-    out-of-band (dashboard disconnect) is detected via the auth-rejected
-    registration, dropped, and re-provisioned once. Servers without the
-    endpoint (404) fall back to the principal silently.
+  - **Identity policy is `COGNEE_PLUGIN_IDENTITY` = `auto` (default) / `true` /
+    `false`.** `auto` provisions only in service of shared agent memory (below) and
+    reverts to the principal when that cannot be wired, so nothing the principal
+    owns is ever stranded; `true` is explicit and strict — provisioning is required
+    and never falls back to the owner; `false` runs as the principal and ignores a
+    cached identity.
+  - **Safe create-only provisioning, credentials bound to server and principal.**
+    Provisioning uses the SDK's `create_only` contract and never rotates an existing
+    key; a credential the server rejected is blocked and never reused, and one bound
+    to another principal is never used. Under `true` those stop with an error; under
+    `auto` the plugin runs as the principal and logs why. Local startup is serialized
+    with an OS lock; credential files are written atomically with owner-only
+    permissions. Servers without `create_only` (or the provision endpoint) leave
+    `auto` installs on the principal.
   - The doctor reports the new key source as **Plugin identity**.
 - **Shared agent memory (default): one memory across all of your plugin
   agents.** A plugin identity is its own user, and cognee's grants flow
@@ -44,8 +47,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
   canonical, user-owned dataset addressed by UUID (`dataset_id`/`dataset_ids`
   on the launch record) — a name only resolves among datasets the caller owns,
   which would fork an empty per-agent copy — and recall, remember, the
-  session-entry store, improve, the sync bridge and the skills all address it
-  that way; pre-existing same-named copies stay in the recall set.
+  session-entry store, improve and the skills all address it that way;
+  pre-existing same-named copies stay in the recall set.
   - **Opt out** with `"shared_agent_memory": false` in config.json or
     `COGNEE_SHARED_AGENT_MEMORY=false` for separated, per-plugin memory (the
     previous behaviour, name-addressed). The agent is removed from the
@@ -54,19 +57,65 @@ project adheres to [Semantic Versioning](https://semver.org/).
     before stays in your user's dataset (still yours, still visible in the
     dashboard). Re-enabling puts it back into the same role and dataset.
   - Degrades to separated memory — never fails a session — when the server
-    has no permissions API, when you are not the owner of your tenant, or when
-    a tenant-less user already owns datasets (activating a tenant would hide
-    them). An existing install that hits one of those stays on the principal.
+    has no permissions API or cannot store session entries by dataset UUID,
+    when you are not the owner of your tenant, or when a tenant-less user
+    already owns datasets (activating a tenant would hide them). Under
+    `auto` an install that hits one of those stays on the principal.
   - Every tenant/role/grant call runs as the *principal*: an agent key can
     never widen its own access (server-enforced, owner-only).
   - The doctor shows **Memory Sharing** (`shared (role: cognee-agent)` /
-    `separated (<reason>)` / `principal (no agent identity)`).
+    `separated (<reason>)` / `principal (...)`).
+- **Dataset UUIDs throughout registration, remember, improve, recall, and
+  switching.** A UUID-shaped dataset is addressed as an id; effective write
+  permissions (not ownership alone) determine the datasets you can switch to,
+  and a failed switch persistence keeps the previous session and unregisters
+  the unused new connection.
+- **Explicit graph read datasets** through `COGNEE_PLUGIN_READ_DATASET_IDS`
+  (a JSON array of UUIDs): federated graph recall separate from the session's
+  single write dataset; it takes precedence over the datasets shared memory
+  resolved.
 
 ### Changed
-- **Agent connections now self-declare `type: "codex"`** at
-  `POST /api/v1/agents/register` (previously the generic `"api"`), matching the
-  server's connection-type registry so the integrations page recognizes the
-  plugin without session-id-prefix heuristics.
+- Native plugin connection types replace the generic API type.
+- Identity provisioning requires `COGNEE_PLUGIN_IDENTITY=true` in `~/.cognee/.env`.
+  `false` explicitly disables cached identities; there is no config.json setting.
+- Safe identity provisioning requires an SDK exposing the `create_only` parameter.
+
+## [1.5.4]
+
+### Fixed
+- **The improve cooldown now actually works.** `COGNEE_IMPROVE_COOLDOWN` (600 s)
+  was kept as a variable inside the idle-watcher process, and that process
+  exits after every bridge and is respawned on the next prompt with the
+  variable reset to zero — so since 2026-05-07 the cooldown gated nothing and
+  a server-side improve ran after essentially every prompt followed by a
+  minute of quiet (one real log: 62 improves on a single session). The last
+  successful improve is now recorded per session on disk
+  (`~/.cognee-plugin/codex/improve-state/<sha1(session)>.json`, written by the improve functions
+  themselves on a confirmed submit), and both automatic triggers — the idle
+  watcher and the every-`COGNEE_AUTO_IMPROVE_EVERY`-entries fire — consult it:
+  no automatic improve runs inside the cooldown, and none runs at all until a
+  new prompt, tool call or answer has been stored since the last one. A
+  throttled watcher keeps polling instead of exiting, so a quiet stretch that
+  outlasts the cooldown still gets exactly one bridge. The session-end final
+  sync, the `cognee-sync` skill and the dataset-switch sync always run.
+- `COGNEE_AUTO_IMPROVE_EVERY=0` now disables the every-N trigger, as the
+  README always claimed; it used to fall back to the default of 150.
+- The watcher's shutdown bridge (SIGTERM from the SessionEnd sync) now runs
+  only when activity is newer than the last recorded improve, instead of
+  always — it used to double the final sync.
+
+### Removed
+- **The legacy full-document bridges.** Any 404/405/422 from
+  `/api/v1/improve` used to mark the server "improve-unsupported" for 24 hours
+  and switch every sync to re-posting the whole accumulated session — every
+  prompt, answer and raw tool output — through `/remember` for a complete
+  re-cognify, per sync. The local-SDK path had a sibling fallback on
+  `TypeError`. Both are gone, along with the `improve-unsupported.json`
+  marker, the per-session qa/trace text mirror in the bridge buffer, and the
+  `COGNEE_BRIDGE_POLL_DEADLINE` / `COGNEE_BRIDGE_SUBMIT_TIMEOUT` knobs. A
+  server without session-aware improve is now logged as `improve_unsupported`
+  and the session is reported as not synced.
 
 ## [1.5.3]
 

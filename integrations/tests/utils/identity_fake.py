@@ -96,6 +96,10 @@ class IdentityFake:
         # False -> every /permissions route answers 404, like a server that
         # predates tenants/roles; the client must stay on separated memory.
         self.permissions_api = True
+        # False -> /openapi.json does not advertise x-cognee-session-dataset-ids
+        # on /remember/entry, like an SDK that rejects typed session writes by
+        # dataset UUID; shared memory must not wire on such a server.
+        self.typed_dataset_ids = True
 
     # -- id helpers --------------------------------------------------------
     def _new_id(self, prefix: str) -> str:
@@ -181,7 +185,9 @@ class IdentityFake:
             self.current_agent = ""
         return 200, {"activeAgents": len(self.registered_agents)}
 
-    def plugins_provision(self, plugin_key: str, api_key: str | None) -> tuple[int, dict[str, Any]]:
+    def plugins_provision(
+        self, plugin_key: str, api_key: str | None, *, create_only: bool = False
+    ) -> tuple[int, dict[str, Any]]:
         """POST /api/v1/integrations/plugins/{plugin_key}/provision.
 
         Mirrors the real endpoint: idempotent get-or-create of an agent
@@ -195,6 +201,8 @@ class IdentityFake:
             return 401, {"detail": "invalid api key"}
 
         record = self.plugin_agents.get(plugin_key)
+        if record and create_only:
+            return 409, {"detail": "Identity already exists"}
         created = record is None
         if record is None:
             owner_id = self.users.get(entry["owner"], {}).get("id", "user")
@@ -345,6 +353,15 @@ class IdentityFake:
 
     def readable_dataset_ids(self, user_id: str) -> list[str]:
         return self.permitted_dataset_ids(user_id, "read")
+
+    def principal_datasets(self, principal_id: str, permission: str) -> list[dict[str, Any]]:
+        """GET /permissions/principals/{id}/datasets: the principal's DIRECT
+        grants only — like the server, no role expansion and no tenant filter."""
+        return [
+            dict(row)
+            for dataset_id, row in self.dataset_rows.items()
+            if permission in self.acl.get(dataset_id, {}).get(principal_id, set())
+        ]
 
     def writable_dataset_ids(self, user_id: str) -> list[str]:
         return self.permitted_dataset_ids(user_id, "write")

@@ -9,11 +9,14 @@ under test (see session-start.py `_ensure_plugin_identity`):
   - a cached agent key wins outright and is never re-provisioned (the server
     ROTATES on every provision call — re-provisioning would revoke the key any
     other machine still holds)
-  - fresh installs provision automatically; existing installs stay on the
-    principal key unless `plugin_identity` is opted in (their datasets are
-    owned by the principal, and the parent->agent share is one-directional)
-  - a 404 from provision means an older server: fall back to the principal
-  - an auth-rejected registration under an agent key re-provisions once
+  - identity mode ``auto`` (default) provisions only in service of shared
+    agent memory and falls back to the principal when that cannot be wired;
+    ``true`` is explicit and never falls back to the owner; ``false`` runs as
+    the principal
+  - provisioning is create-only: a server without that contract is
+    "unsupported" — an error under ``true``, the principal under ``auto``
+  - an auth-rejected agent key is blocked and never re-provisioned: an error
+    under ``true``, a fallback to the principal under ``auto``
 """
 
 from __future__ import annotations
@@ -97,14 +100,11 @@ def test_provision_requires_a_principal_key(suite, pc, mock_server):
     mock_server.assert_not_called("POST", PROVISION_PATH[suite.name])
 
 
-def test_reprovision_rotates_and_revokes_the_old_key(suite, pc, mock_server):
+def test_reprovision_does_not_rotate_the_old_key(suite, pc, mock_server):
     _, first = pc.provision_plugin_agent_via_http(principal_key=PRINCIPAL_KEY)
-    _, second = pc.provision_plugin_agent_via_http(principal_key=PRINCIPAL_KEY)
-    assert second["created"] is False
-    assert first["agent_id"] == second["agent_id"]
-    assert first["api_key"] != second["api_key"]
-    assert mock_server.identity.valid_keys[first["api_key"]]["valid"] is False
-    assert mock_server.identity.valid_keys[second["api_key"]]["valid"] is True
+    status, _ = pc.provision_plugin_agent_via_http(principal_key=PRINCIPAL_KEY)
+    assert status == "failed"
+    assert mock_server.identity.valid_keys[first["api_key"]]["valid"] is True
 
 
 # ── agent-key cache + key resolution ────────────────────────────────────────
@@ -119,7 +119,7 @@ def test_agent_key_cache_roundtrip_is_url_scoped(suite, pc):
 
 
 def test_api_key_resolution_prefers_the_plugin_identity(suite, pc, mock_server):
-    pc.save_cached_agent_key(mock_server.url, "agent-key-1", "agent-1")
+    pc.save_cached_agent_key(mock_server.url, "agent-key-1", "agent-1", principal_key=PRINCIPAL_KEY)
     key, source = pc._api_key_with_source(mock_server.url)
     assert (key, source) == ("agent-key-1", "plugin_agent_key")
 
@@ -157,9 +157,9 @@ def bootstrap(suite, hook_module, mock_server, monkeypatch):
     return module, run
 
 
-def test_fresh_install_provisions_a_plugin_identity(suite, bootstrap, mock_server):
+def test_fresh_install_requires_explicit_identity_opt_in(suite, bootstrap, mock_server):
     module, run = bootstrap
-    _user_id, api_key, _name, ok = run({})
+    _user_id, api_key, _name, ok = run({"plugin_identity": True})
     assert ok
     assert api_key.startswith("agentkey-")
     mock_server.assert_called("POST", PROVISION_PATH[suite.name])
@@ -224,7 +224,7 @@ def test_existing_install_provisions_on_opt_in(suite, bootstrap, mock_server, mo
 
 def test_cached_agent_key_is_reused_not_reprovisioned(suite, bootstrap, mock_server):
     module, run = bootstrap
-    _u, first_key, _n, _ok = run({})
+    _u, first_key, _n, _ok = run({"plugin_identity": True})
     mock_server.calls.clear()
     _u, second_key, _n, ok = run({})
     assert ok
@@ -232,9 +232,9 @@ def test_cached_agent_key_is_reused_not_reprovisioned(suite, bootstrap, mock_ser
     mock_server.assert_not_called("POST", PROVISION_PATH[suite.name])
 
 
-def test_revoked_agent_key_reprovisions_once(suite, pc, bootstrap, mock_server):
+def test_revoked_agent_key_stays_disconnected(suite, pc, bootstrap, mock_server):
     module, run = bootstrap
-    _u, first_key, _n, _ok = run({})
+    _u, first_key, _n, _ok = run({"plugin_identity": True})
     mock_server.calls.clear()
 
     # Revoke out-of-band (dashboard disconnect / rotation on another machine):
@@ -242,11 +242,53 @@ def test_revoked_agent_key_reprovisions_once(suite, pc, bootstrap, mock_server):
     mock_server.identity.invalidate_key(first_key)
     mock_server.force_response("POST", "/api/v1/agents/register", 401, {"detail": "revoked"})
 
-    # The forced 401 also rejects the retried registration, so the bootstrap
-    # ultimately fails — but on the way it must have dropped the stale key and
-    # re-provisioned exactly once (not per-attempt).
-    with pytest.raises(RuntimeError):
+    # Under ``auto`` the rejected key is blocked and the launch falls back to
+    # the principal — which the forced 401 also rejects, so the bootstrap
+    # fails; on the way it must never have re-provisioned.
+    with pytest.raises(RuntimeError, match="Failed to register"):
         run({})
     calls = [c for c in mock_server.calls if c["path"] == PROVISION_PATH[suite.name]]
+    assert len(calls) == 0
+    assert pc._load_json_file(pc._AGENT_KEY_CACHE)["blocked"] is True
+    # The data plane never uses the blocked key: the principal under ``auto``...
+    key, source = pc._api_key_with_source(mock_server.url)
+    assert key != first_key and source != "plugin_agent_key"
+    # ...and an error under explicit identity.
+    monkeypatch_env = pytest.MonkeyPatch()
+    try:
+        monkeypatch_env.setenv("COGNEE_PLUGIN_IDENTITY", "true")
+        with pytest.raises(RuntimeError, match="rejected"):
+            pc._api_key_with_source(mock_server.url)
+        with pytest.raises(RuntimeError, match="disconnected"):
+            run({"plugin_identity": True})
+    finally:
+        monkeypatch_env.undo()
+
+
+def test_concurrent_startups_provision_only_once(suite, bootstrap, mock_server):
+    from concurrent.futures import ThreadPoolExecutor
+
+    module, _ = bootstrap
+
+    def connect():
+        return asyncio.run(
+            module._ensure_plugin_identity(
+                mock_server.url, {"plugin_identity": True}, PRINCIPAL_KEY
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        keys = list(workers.map(lambda _: connect(), range(2)))
+    assert keys[0] == keys[1]
+    calls = [call for call in mock_server.calls if call["path"] == PROVISION_PATH[suite.name]]
     assert len(calls) == 1
-    assert pc.load_cached_agent_key(mock_server.url) not in ("", first_key)
+
+
+def test_enabled_identity_does_not_fall_back_when_server_is_unsupported(
+    suite, bootstrap, mock_server
+):
+    _, run = bootstrap
+    mock_server.identity.plugin_provisioning = False
+    with pytest.raises(RuntimeError, match="fallback is disabled"):
+        run({"plugin_identity": True, "api_key": PRINCIPAL_KEY})
+    mock_server.assert_not_called("POST", "/api/v1/agents/register")
