@@ -180,6 +180,25 @@ data, so what it shared before stays in your user's dataset. Re-enabling puts th
 back into the same role and dataset. The doctor shows the current state under
 **Memory Sharing**.
 
+#### How the two settings combine
+
+`COGNEE_PLUGIN_IDENTITY` decides *who the plugin authenticates as, and how strictly*;
+`COGNEE_SHARED_AGENT_MEMORY` decides *what an agent identity can see*. Sharing is a
+property of agent identities — your own user sees everything regardless — so the second
+setting only matters once an identity exists.
+
+| `COGNEE_PLUGIN_IDENTITY` \ `COGNEE_SHARED_AGENT_MEMORY` | `true` (default) | `false` |
+|---|---|---|
+| `auto` (default) | **Shared memory, graceful.** Provisions an identity when the server allows it, wires the shared role, and falls back to your principal key whenever that cannot be done. | **Principal, unless already provisioned.** A fresh install never provisions (`auto` provisions only in service of sharing). An identity provisioned earlier is kept, leaves the shared role, and writes to its own private dataset. |
+| `true` | **Shared memory, strict.** Same wiring; any obstacle (no `create_only` support, a credential bound to another principal, a rejected key) is an error — never a silent fall back to the owner's key. | **Separated identities, strict.** Each plugin is its own agent with its own private memory, blind to your other datasets. This is the isolation mode: a leaked or revoked plugin key affects only that plugin. |
+| `false` | **Principal only.** The sharing setting has no effect. | **Principal only.** Identical to the cell above. |
+
+Practical reading: leave both at their defaults for one memory across all of your plugins;
+set `COGNEE_PLUGIN_IDENTITY=true` when you want the strict guarantees; add
+`COGNEE_SHARED_AGENT_MEMORY=false` to that for fully separated per-plugin memory. Setting
+`COGNEE_PLUGIN_IDENTITY=false` makes the sharing setting irrelevant. The doctor reports the
+resulting state under **API Key Source** and **Memory Sharing**.
+
 ## Mode selection rules
 
 At startup (`SessionStart`):
