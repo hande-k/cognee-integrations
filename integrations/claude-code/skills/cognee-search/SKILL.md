@@ -1,102 +1,110 @@
 ---
 name: cognee-search
-description: Search Cognee memory. Session memory is automatically searched on every prompt via hooks. Use this skill explicitly for permanent knowledge graph search, filtered category search, or when you need more results than the automatic lookup provides.
+description: Discover and search connected-source memory through Cognee using metadata routing, dataset and node-set filters, citations and paginated document browsing.
 ---
 
 # Cognee Memory Search
 
-Search both session memory and the permanent knowledge graph, optionally filtered by data category.
+Use the installed plugin for memory reads. Its commands use the same identity
+resolver as capture hooks. Never retry denied access with an owner credential,
+a direct database read, or another memory store.
 
-## Automatic session search
-
-Session memory is searched **automatically on every user prompt** via the `UserPromptSubmit` hook. You do not need to run this skill to access current-session context.
-
-## Data categories
-
-Knowledge is organized into three categories via `node_set`:
-
-| Category | Node set | Contains |
-|----------|----------|----------|
-| **user** | `user_context` | User preferences, corrections, personal facts |
-| **project** | `project_docs` | Repository docs, code context, architecture decisions |
-| **agent** | `agent_actions` | Tool call logs, reasoning traces, generated artifacts |
-
-## Instructions
-
-Search goes through the **running Cognee server** (`POST /api/v1/recall`) — the source of truth. Use the wrapper below: it queries the server first, scoped to the **plugin's dataset** (`$COGNEE_PLUGIN_DATASET`, default `agent_sessions` — the same dataset all plugin writes target, so unrelated datasets don't bleed in), and falls back to `cognee-cli` only if the server is unreachable.
-
-**One broad search is usually enough** — the `UserPromptSubmit` hook already injects session/trace/graph context every turn, so avoid running many targeted searches (each is an extra permission prompt for the user).
-
-### Search (server-first)
+## Discover and select
 
 ```bash
-# session cache + permanent graph (default)
-${CLAUDE_PLUGIN_ROOT}/scripts/cognee-search.sh "$ARGUMENTS"
-
-# permanent graph only
-${CLAUDE_PLUGIN_ROOT}/scripts/cognee-search.sh "$ARGUMENTS" 10 --graph
-
-# current session only
-${CLAUDE_PLUGIN_ROOT}/scripts/cognee-search.sh "$ARGUMENTS" 10 --session
-
-# deterministic code graph (indexed repos only — see the cognee-code skill)
-${CLAUDE_PLUGIN_ROOT}/scripts/cognee-search.sh "MyClass" 10 --code
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/cognee-memory.py" status
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/cognee-memory.py" sources --limit 50
+# Continue with --offset <next_offset> while next_offset is present.
 ```
 
-**Structural code questions belong to `--code`, not here.** "What calls X",
-"what breaks if I change X", "list all endpoints" are answered exactly and
-token-free by the code graph — see the **cognee-code** skill for the
-operations and for indexing a repository. Use this skill's semantic search for
-conceptual questions that name no symbol ("how does auth work here?").
+The catalog contains permission-filtered datasets and node sets with stable IDs,
+names, source aliases, short descriptions, sample document labels and available
+operations. It is derived from current Cognee metadata; there is no provider list
+in the plugin. A new connector's imported node sets are discoverable without a
+plugin update. Empty connections with no imported data are not catalog entries.
 
-### Filter by category (optional)
-
-Categories (`user_context` / `project_docs` / `agent_actions`) filter by node set. `cognee-cli recall` does **not** expose this — pass `node_name` to the server directly:
+Session capture keeps one write dataset. To select several readable graph datasets:
 
 ```bash
-curl -s -X POST "${COGNEE_BASE_URL:-http://localhost:8011}/api/v1/recall" \
-  -H "Content-Type: application/json" \
-  -H "X-Api-Key: ${COGNEE_API_KEY:-}" \
-  -d '{"query": "...", "top_k": 5, "only_context": true, "scope": ["graph"], "node_name": ["project_docs"], "datasets": ["'"${COGNEE_PLUGIN_DATASET:-agent_sessions}"'"]}'
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/memory-access.py" read --persist --dataset-id <uuid> --dataset-id <uuid>
 ```
 
-### Ground-truth a suspicious result (debugging)
+This selects reads, never grants access or changes writes. Include the session
+dataset UUID to retain durable session learnings in graph recall. Persistent
+selection is bound to this identity and backend; launch-specific selection wins.
+Without a selection, general search uses the write dataset. A free-form source
+hint can discover across readable datasets when no read selection exists.
+`--all-readable` explicitly expands discovery beyond the saved read selection;
+explicit `--dataset-id` values always take precedence. ACLs still apply.
 
-The server is authoritative. If a search returns empty but you expect content, confirm directly — **do not** conclude "not found" from empty CLI output:
+## Route questions and retrieve evidence
 
 ```bash
-curl -s -X POST "${COGNEE_BASE_URL:-http://localhost:8011}/api/v1/recall" \
-  -H "Content-Type: application/json" \
-  -H "X-Api-Key: ${COGNEE_API_KEY:-}" \
-  -d '{"query": "...", "top_k": 5, "only_context": true, "scope": ["graph"], "datasets": ["'"${COGNEE_PLUGIN_DATASET:-agent_sessions}"'"]}'
+"${CLAUDE_PLUGIN_ROOT}/scripts/cognee-search.sh" "What did we decide about deployment?" 10 --all-readable
+"${CLAUDE_PLUGIN_ROOT}/scripts/cognee-search.sh" "What was discussed?" 10 --source "demo channel"
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/cognee-memory.py" route "deployment decisions" --source "meeting notes"
 ```
 
-(An authed/cloud server needs `COGNEE_API_KEY`; a local single-user server ignores an empty key. If the response is an `{"error": ...}` object rather than a list, the server was reachable but rejected/failed the request — that's an error, **not** "no results".)
+`--source` accepts natural language, not an enum. Cognee's configured LLM selects
+likely targets from authorized metadata, then the plugin retrieves native CHUNKS
+from those targets. Routing does not read source bodies or contact connectors.
+The server validates model-selected IDs; model output cannot invent permissions
+or arbitrary tool calls. `route` previews targets and reasons without content search.
 
-### Fallback only — server unreachable
+Routing considers up to 512 catalog entries by default. `--catalog-budget 2048`
+raises that explicit budget. Descriptors are processed in batches of at most 64,
+with at most three LLM calls concurrently per routing request, followed by joint
+re-ranking. This adds LLM cost and latency. At most six targets are searched by
+default (`--max-sources`, maximum eight). Catalog limits and uncertain routing are
+reported; an empty route is NOT evidence that the answer does not exist.
 
-`cognee-cli` is a thin client over the same server and can print **empty stdout even when content exists**. Use it only when the server is down, and treat empty output as *inconclusive*, never as "no results":
+If evidence is insufficient, inspect the routing and catalog, refine the question
+and make one further search excluding already searched target IDs with repeated
+`--exclude-source-id <uuid>`. Ask for clarification if ambiguity remains. Do not
+silently claim that every dataset was searched. Source selection is heuristic.
+
+For known targets, bypass LLM routing:
 
 ```bash
-cognee-cli recall "$ARGUMENTS" -k 5 -f json
+"${CLAUDE_PLUGIN_ROOT}/scripts/cognee-search.sh" "deployment" 10 --dataset-id <uuid> --node-set <name>
+"${CLAUDE_PLUGIN_ROOT}/scripts/cognee-search.sh" "deployment" 10 --dataset-id <uuid> --exact
 ```
 
-## Understanding results
+Repeated node sets use AND by default; `--node-match any` uses OR. Exact search
+requires selected dataset UUIDs and cannot be combined with a source hint.
+Session-only recall uses `--session`; structural code search uses `--code` and
+the codebase skill. Neither uses source routing.
 
-Results include a `_source` field:
-- `"session"` — from the session cache (current conversation)
-- `"graph"` — from the permanent knowledge graph
-- `"code"` — deterministic facts from an indexed repository's code graph
+## Browse and read original evidence
 
-Session entries tagged with `[category:agent]` are automatic tool call logs.
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/cognee-memory.py" browse <source-id> --limit 100
+# Continue the same source with --cursor <next_cursor> until null.
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/cognee-memory.py" read <document-id> --dataset-id <dataset-id>
+```
 
-## Decision table
+Browse pages contain stored document metadata, not individual provider messages.
+Read fetches the original stored text and its provenance. Pagination uses native
+record UUIDs, rechecks permissions each page and does not promise snapshot
+isolation during concurrent imports/deletions. Source event timestamps must be
+interpreted from the document; an ingestion/update timestamp is not an event date
+or a synchronization time. No provider-specific date-window parser is provided.
 
-| Signal | Action |
-|--------|--------|
-| Need current session context | Already automatic, no action needed |
-| User explicitly says "search cognee" | `cognee-search.sh "<query>"` (server-first) |
-| "what does the codebase do" / "what did we do last time" | `cognee-search.sh "<query>" 10 --graph` |
-| Need a specific category | use the `node_name` curl form above (`["user_context"\|"project_docs"\|"agent_actions"]`) |
-| Auto context insufficient | `cognee-search.sh "<query>" 10 --session` |
-| **Result empty but you expect content** | **Ground-truth via the `curl` above before concluding "not found"** |
+Report evidence links, the actual searched targets, and coverage limitations.
+Ranked chunks are not an exhaustive export. Imported records do not establish
+that a source is fully synchronized. Unknown synchronization time stays unknown.
+These commands search stored memory: an imported database schema is searchable,
+but fetching live rows requires the existing authorized Cognee tool connection.
+Do not silently ingest rows or fetch from a connector to fill missing evidence.
+
+## Compatibility and failures
+
+Source discovery requires the SDK's `/api/v1/datasets/source-catalog`,
+`source-route`, `source-documents` and `source-document` routes, plus HTTP node-set
+operator forwarding. Missing routes are reported as a server capability error.
+Each response is limited to 16 MiB and each command to 64 MiB. Budget errors are
+failures, not successful complete results.
+
+`status` reports whether the current credential is an agent or a legacy user
+principal. Searches never provision identities, rotate credentials or change ACLs.
+For permissions, use the manage-access skill explicitly.

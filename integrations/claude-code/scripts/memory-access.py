@@ -41,8 +41,8 @@ def change_permission(principal_id, dataset_ids, permission, *, revoke=False):
     )
 
 
-def set_read_scope(host_key, dataset_ids):
-    if not pc._read_map_record(host_key).get("session_id"):
+def set_read_scope(host_key, dataset_ids, *, persistent=False):
+    if not persistent and not pc._read_map_record(host_key).get("session_id"):
         raise RuntimeError("No active launch record; pass the host session ID")
     ids = [dataset_id(value) for value in dataset_ids]
     if not all(ids):
@@ -56,11 +56,17 @@ def set_read_scope(host_key, dataset_ids):
         "credential_fingerprint": pc._principal_fingerprint(pc._api_key()),
         "dataset_ids": list(dict.fromkeys(ids)),
     }
-    path = pc.graph_read_scope_path(host_key)
+    path = (
+        pc.persistent_graph_read_scope_path() if persistent else pc.graph_read_scope_path(host_key)
+    )
     pc._write_json_file(path, scope)
     if pc._load_json_file(path) != scope:
         raise RuntimeError("Read scope was not persisted")
-    return {"read_dataset_ids": scope["dataset_ids"], "session_key": host_key}
+    return {
+        "read_dataset_ids": scope["dataset_ids"],
+        "session_key": host_key,
+        "persistent": persistent,
+    }
 
 
 def connect_existing_identity(agent_key):
@@ -94,7 +100,10 @@ def main(argv=None):
         child.add_argument("--dataset-id", action="append", required=True)
         child.add_argument("--permission", choices=("read", "write"), required=True)
     child = sub.add_parser("read")
-    child.add_argument("--session-key", required=True)
+    child.add_argument("--session-key", default="")
+    child.add_argument(
+        "--persist", action="store_true", help="Default for future sessions of this identity"
+    )
     child.add_argument("--dataset-id", action="append", default=[])
     child = sub.add_parser("write")
     child.add_argument("dataset_id")
@@ -107,7 +116,7 @@ def main(argv=None):
             args.principal_id, args.dataset_id, args.permission, revoke=args.command == "revoke"
         )
     elif args.command == "read":
-        result = set_read_scope(args.session_key, args.dataset_id)
+        result = set_read_scope(args.session_key, args.dataset_id, persistent=args.persist)
     elif args.command == "connect":
         result = connect_existing_identity(os.environ.get(args.key_env, ""))
     elif args.command == "write":
