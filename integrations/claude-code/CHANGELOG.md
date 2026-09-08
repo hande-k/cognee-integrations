@@ -10,7 +10,7 @@ Code only offers an update when that string changes. Tag releases as
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.6.0]
+## [1.5.1]
 
 ### Removed
 - **The in-process "local SDK" execution path is gone.** Every hook is now an

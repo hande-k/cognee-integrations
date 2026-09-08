@@ -10,7 +10,7 @@ is the cache key and semver record, bumped on each release, not the update trigg
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.7.0]
+## [1.6.1]
 
 ### Removed
 - **The in-process "local SDK" execution path is gone.** Every hook is now an
