@@ -100,12 +100,87 @@ On startup you should see a "Cognee Memory Connected" system message.
 
 ## Auth
 
-The integration uses a **single auth principal** — one API key, one user.
+The integration authenticates with **one principal** (one API key, one user), and —
+on servers that support it — a **plugin identity** derived from that principal: a
+dedicated agent sub-user with its own labeled API key, provisioned via
+`POST /api/v1/integrations/plugins/claude-code/provision`. Running under a plugin
+identity lets the cognee dashboard attribute sessions, traces and datasets to this
+plugin; datasets the plugin creates are automatically shared with your user.
 
-Key resolution order:
-1. `COGNEE_API_KEY` env var
-2. `~/.cognee-plugin/api_key.json` (cached from a previous mint)
-3. Auto-mint from the default local user (local mode only), then cache to `api_key.json`
+Key resolution order for data-plane traffic:
+1. `~/.cognee-plugin/claude-code/agent_key.json` (the provisioned plugin identity)
+2. `COGNEE_API_KEY` env var
+3. `~/.cognee-plugin/api_key.json` (cached from a previous mint)
+4. Auto-mint from the default local user (local mode only), then cache to `api_key.json`
+
+Provisioning policy:
+- `COGNEE_PLUGIN_IDENTITY` selects the identity policy:
+  - `auto` (default) — an identity **in service of shared agent memory** (below). When
+    shared memory is on, session start provisions one (create-only, never rotating a key
+    another machine holds), wires the shared role, and pins the canonical dataset; if that
+    wiring cannot be done (older server, not the tenant owner, tenant-less user who already
+    owns data) the plugin stays on the principal key and says why in `cognee-doctor`. With
+    shared memory off it stays on the principal.
+  - `true` — explicit identity: provisioning is required and never falls back to the owner.
+    Servers without the SDK's `create_only` capability, a cached credential bound to another
+    principal, or rejected credentials stop with an error instead of rotating keys or
+    silently using the owner's authority.
+  - `false` — principal mode; a cached identity is ignored.
+- A cached credential is bound to its server and principal. Under `auto`, a credential the
+  server rejected or that belongs to another account is not used and the plugin runs as
+  the principal (logged); under `true` that is an error, and reconnecting a revoked
+  identity requires explicit reconnection.
+- Use dataset UUIDs for shared write targets. Dataset switching checks effective write
+  permissions. Set `COGNEE_PLUGIN_READ_DATASET_IDS` to a JSON array of allowed UUIDs for
+  graph recall across datasets you granted yourself; it takes precedence over the datasets
+  shared memory resolved, and session history stays scoped to its own dataset.
+
+### Shared agent memory
+
+A plugin identity is its own cognee user, and grants only flow child→parent: your user
+sees what the agent writes, but the agent sees nothing your user (or another plugin's
+agent) owns. Left alone, that would silo memory per plugin — Claude Code could not recall
+what Codex stored. **Shared agent memory, on by default, makes every plugin agent of
+your user share one memory:**
+
+- Session start ensures your user owns a tenant (one is created for a fresh, tenant-less
+  install) and a `cognee-agent` role in it, adds the agent to both, and grants the role
+  read+write on your datasets. Grants are backfilled on every session start and every
+  ~60 s by the idle watcher, so a dataset another plugin creates becomes visible here
+  without a restart.
+- The launch's dataset is a **canonical, user-owned dataset addressed by UUID** (the
+  launch record's `dataset_id` for writes, `dataset_ids` for recall — including any
+  same-named per-agent copies from before). Every hook and skill addresses it that way;
+  a plain name would only resolve among datasets the agent itself owns.
+- All tenant/role/grant calls run as your user, never as the agent — the server only
+  lets the tenant owner manage roles, so an agent key cannot widen its own access.
+
+Turn it off with `"shared_agent_memory": false` in `config.json` or
+`COGNEE_SHARED_AGENT_MEMORY=false` for separated, per-plugin memory (name-addressed,
+agent-owned datasets). Opting out removes the agent from the shared role — it can no
+longer read or write your datasets — and starts it on a private dataset; it does not move
+data, so what it shared before stays in your user's dataset. Re-enabling puts the agent
+back into the same role and dataset. `cognee-doctor` shows the current state under
+**Memory Sharing**.
+
+#### How the two settings combine
+
+`COGNEE_PLUGIN_IDENTITY` decides *who the plugin authenticates as, and how strictly*;
+`COGNEE_SHARED_AGENT_MEMORY` decides *what an agent identity can see*. Sharing is a
+property of agent identities — your own user sees everything regardless — so the second
+setting only matters once an identity exists.
+
+| `COGNEE_PLUGIN_IDENTITY` \ `COGNEE_SHARED_AGENT_MEMORY` | `true` (default) | `false` |
+|---|---|---|
+| `auto` (default) | **Shared memory, graceful.** Provisions an identity when the server allows it, wires the shared role, and falls back to your principal key whenever that cannot be done. | **Principal, unless already provisioned.** A fresh install never provisions (`auto` provisions only in service of sharing). An identity provisioned earlier is kept, leaves the shared role, and writes to its own private dataset. |
+| `true` | **Shared memory, strict.** Same wiring; any obstacle (no `create_only` support, a credential bound to another principal, a rejected key) is an error — never a silent fall back to the owner's key. | **Separated identities, strict.** Each plugin is its own agent with its own private memory, blind to your other datasets. This is the isolation mode: a leaked or revoked plugin key affects only that plugin. |
+| `false` | **Principal only.** The sharing setting has no effect. | **Principal only.** Identical to the cell above. |
+
+Practical reading: leave both at their defaults for one memory across all of your plugins;
+set `COGNEE_PLUGIN_IDENTITY=true` when you want the strict guarantees; add
+`COGNEE_SHARED_AGENT_MEMORY=false` to that for fully separated per-plugin memory. Setting
+`COGNEE_PLUGIN_IDENTITY=false` makes the sharing setting irrelevant. `cognee-doctor` reports the
+resulting state under **API Key Source** and **Memory Sharing**.
 
 ## Mode selection rules
 

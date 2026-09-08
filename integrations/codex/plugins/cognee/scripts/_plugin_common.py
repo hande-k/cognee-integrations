@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Optional
 
 import _proc
+from _dataset_access import dataset_id as parse_dataset_id
+from _dataset_access import recall_fields, write_fields
 from _env_file import load_env_file
 from _logfiles import append_line as _append_log_line
 from _logfiles import rotate_if_oversized as _rotate_log_if_oversized
@@ -65,6 +67,22 @@ _SUBPROCESS_LOG = _PLUGIN_DIR / "subprocess.log"
 # Single-principal model: one API key (user-provided COGNEE_API_KEY or one minted
 # from the default user) is cached here. Replaces the old per-agent agent_keys.json.
 _API_KEY_CACHE = _SHARED_PLUGIN_ROOT / "api_key.json"
+# Plugin identity (server-side agent sub-user). Servers that expose
+# POST /api/v1/integrations/plugins/{key}/provision mint a dedicated agent
+# sub-user + API key per plugin, so cognee can attribute traffic to this
+# plugin instead of the shared principal. The key is per-plugin state (the
+# Claude Code plugin has its own identity), hence _PLUGIN_DIR, not the shared
+# root the principal key lives at.
+PLUGIN_KEY = "codex"
+CONNECTION_TYPE = "codex"
+_AGENT_KEY_CACHE = _PLUGIN_DIR / "agent_key.json"
+# Shared agent memory: the role every provisioned plugin agent of a user joins
+# so all of them read/write the user's datasets (see ensure_shared_memory).
+# The marker records the tenant/role wiring, the canonical dataset ids this
+# plugin resolved, and which datasets the role was already granted, so a
+# session start / watcher refresh only issues the calls that are still missing.
+AGENT_ROLE_NAME = "cognee-agent"
+_SHARED_MEMORY_MARKER = _PLUGIN_DIR / "shared_memory.json"
 # Host-session-id -> generated Cognee session-id map. The host (Claude/Codex)
 # session id is used ONLY as a local correlation key so every hook process of a
 # single launch resolves the SAME Cognee session id; it is never sent to Cognee
@@ -383,6 +401,132 @@ def resolve_active_dataset(host_key: str = "") -> str:
     return str(os.environ.get("COGNEE_PLUGIN_DATASET", "") or "").strip() or _DEFAULT_DATASET_NAME
 
 
+def resolve_active_dataset_ids(host_key: str = "") -> tuple[str, list[str]]:
+    """The launch's dataset as UUIDs: ``(write_id, read_ids)``.
+
+    Under shared agent memory the active dataset is addressed by id, not name:
+    a name only ever resolves server-side among the datasets the CALLER owns,
+    so an agent asking for ``agent_sessions`` by name would fork its own empty
+    copy instead of reaching the canonical (parent-owned) one it was granted.
+    ``write_id`` is that canonical dataset; ``read_ids`` is it plus every other
+    readable same-named dataset (legacy per-agent copies), so recall spans them
+    all. Both empty when the launch runs name-addressed (separated memory,
+    older server) — callers then fall back to the name.
+    """
+    host_key = _sanitize_session_key(host_key) or get_session_key()
+    if not host_key:
+        return "", []
+    rec = _read_map_record(host_key)
+    write_id = str(rec.get("dataset_id") or "").strip()
+    read_ids = [str(x).strip() for x in (rec.get("dataset_ids") or []) if str(x).strip()]
+    if write_id and write_id not in read_ids:
+        read_ids.insert(0, write_id)
+    return write_id, read_ids
+
+
+def set_launch_dataset_ids(
+    host_key: str, write_id: str, read_ids: list[str], *, dataset: str = ""
+) -> bool:
+    """Record the active dataset's resolved UUIDs on the launch record.
+
+    Called by SessionStart (after the canonical dataset is resolved) and by the
+    idle watcher's periodic refresh; the dataset switch writes its own ids
+    inside ``switch_launch_record``. Never touches the name/session/conn triple.
+
+    Serialised with the switch on the launch's switch lock, and when ``dataset``
+    is given the ids land only while the record still names that dataset: the
+    refresh resolves ids over several network calls, and a switch completing
+    meanwhile must not end up with the previous dataset's UUIDs under the new
+    name. Returns True when the record was written.
+    """
+    host_key = _sanitize_session_key(host_key) or get_session_key()
+    if not host_key:
+        return False
+    from _file_lock import file_lock
+
+    lock_path = _session_map_path(host_key).with_suffix(".switch.lock")
+    with file_lock(lock_path, timeout=_float_env("COGNEE_SWITCH_LOCK_TIMEOUT", 5.0)) as held:
+        if not held:
+            hook_log(
+                "launch_dataset_ids_skipped",
+                {"host_key": host_key, "reason": "switch_in_progress"},
+            )
+            return False
+        rec = _read_map_record(host_key)
+        if not rec:
+            return False
+        if dataset and str(rec.get("dataset") or "").strip() != str(dataset).strip():
+            hook_log(
+                "launch_dataset_ids_skipped",
+                {"host_key": host_key, "reason": "dataset_switched"},
+            )
+            return False
+        merged = dict(rec)
+        merged["dataset_id"] = str(write_id or "").strip()
+        merged["dataset_ids"] = [str(x).strip() for x in read_ids if str(x).strip()]
+        if merged.get("dataset_id") == rec.get("dataset_id") and merged["dataset_ids"] == (
+            rec.get("dataset_ids") or []
+        ):
+            return False
+        _write_map_record(host_key, merged)
+        return True
+
+
+def dataset_id_for(dataset: str, host_key: str = "") -> str:
+    """The canonical UUID to WRITE ``dataset`` (a name) under, or "".
+
+    Resolution: the launch record when ``dataset`` is the launch's active
+    dataset, else the shared-memory marker's canonical map (names this plugin
+    has resolved before — e.g. a retired pre-switch dataset the final sync
+    still bridges). Empty means "address by name", the pre-shared behaviour.
+    """
+    dataset = str(dataset or "").strip()
+    if not dataset:
+        return ""
+    host_key = _sanitize_session_key(host_key) or get_session_key()
+    if host_key:
+        rec = _read_map_record(host_key)
+        if str(rec.get("dataset") or "").strip() == dataset:
+            write_id = str(rec.get("dataset_id") or "").strip()
+            if write_id:
+                return write_id
+    # The marker's canonical map only applies while shared memory is live:
+    # after an opt-out the plugin writes name-addressed (its own dataset), and
+    # a stale id here would send writes to the shared dataset that recall —
+    # now by name — no longer reads.
+    if not shared_memory_enabled():
+        return ""
+    marker = load_shared_memory_marker()
+    canonical = marker.get("canonical") if marker.get("mode") == "shared" else None
+    if isinstance(canonical, dict):
+        return str(canonical.get(dataset) or "").strip()
+    return ""
+
+
+def shell_runtime_overrides(service_url: str = "") -> dict:
+    """Launch-record state for the shell skills (cognee-search.sh / cognee-remember.sh).
+
+    Those run under the host's shell tool with no hook payload, so they find
+    their launch record via ``resolve_host_key_outside_hook``. Returns the
+    record's ``session_id`` / ``dataset`` (both empty when unrecorded), the
+    dataset's canonical ``dataset_id`` and comma-joined ``dataset_ids``, and
+    ``api_key`` — the provisioned plugin-agent key when one is cached, so the
+    skills act as the same identity as the hooks (see ``_api_key_with_source``).
+    Kept to one call on purpose: the skills embed Python in a ``$( <<'PY' )``
+    block that macOS's bash 3.2 mis-parses once it grows past a few lines.
+    """
+    host_key, _ = resolve_host_key_outside_hook()
+    rec = _read_map_record(host_key) if host_key else {}
+    write_id, read_ids = resolve_active_dataset_ids(host_key) if host_key else ("", [])
+    return {
+        "session_id": str(rec.get("session_id") or "").strip(),
+        "dataset": str(rec.get("dataset") or "").strip(),
+        "dataset_id": write_id,
+        "dataset_ids": ",".join(read_ids),
+        "api_key": active_agent_key(service_url),
+    }
+
+
 def touched_pairs(host_key: str = "") -> list[dict]:
     """Every (session_id, dataset, conn_uuid) this launch has used, oldest first.
 
@@ -452,6 +596,8 @@ def switch_launch_record(
     session_id: str,
     dataset: str,
     conn_uuid: str,
+    dataset_id: str = "",
+    dataset_ids: list[str] | None = None,
 ) -> dict:
     """Atomically point the launch at a new (session, dataset, connection).
 
@@ -463,6 +609,34 @@ def switch_launch_record(
     host_key = _sanitize_session_key(host_key) or get_session_key()
     if not host_key:
         raise ValueError("switch_launch_record: no host session key")
+    from _file_lock import file_lock
+
+    # One switch at a time per launch: the write-then-verify below has no
+    # transactional guarantee, so a concurrent switch landing in between would
+    # make a successful write look unpersisted (and vice versa).
+    lock_path = _session_map_path(host_key).with_suffix(".switch.lock")
+    with file_lock(lock_path, timeout=_float_env("COGNEE_SWITCH_LOCK_TIMEOUT", 5.0)) as held:
+        if not held:
+            raise RuntimeError("Another dataset switch is in progress for this launch")
+        return _switch_launch_record_locked(
+            host_key,
+            session_id=session_id,
+            dataset=dataset,
+            conn_uuid=conn_uuid,
+            dataset_id=dataset_id,
+            dataset_ids=dataset_ids,
+        )
+
+
+def _switch_launch_record_locked(
+    host_key: str,
+    *,
+    session_id: str,
+    dataset: str,
+    conn_uuid: str,
+    dataset_id: str,
+    dataset_ids: list[str] | None,
+) -> dict:
     rec = _read_map_record(host_key)
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     touched = touched_pairs(host_key)
@@ -479,6 +653,10 @@ def switch_launch_record(
             "host_key": host_key,
             "session_id": _sanitize_session_key(session_id),
             "dataset": str(dataset).strip(),
+            # The old dataset's ids must not survive the switch: an id-addressed
+            # write to the new name would otherwise land in the previous dataset.
+            "dataset_id": str(dataset_id or "").strip(),
+            "dataset_ids": [str(x).strip() for x in (dataset_ids or []) if str(x).strip()],
             "conn_uuid": str(conn_uuid),
             "switched_at": now,
             "touched": touched,
@@ -486,6 +664,12 @@ def switch_launch_record(
     )
     merged.setdefault("created_at", now)
     _write_map_record(host_key, merged)
+    saved = _read_map_record(host_key)
+    if any(
+        saved.get(key) != merged[key]
+        for key in ("session_id", "dataset", "conn_uuid", "dataset_id", "dataset_ids")
+    ):
+        raise RuntimeError("Dataset switch was not persisted; previous session remains active")
     hook_log(
         "dataset_switched",
         {
@@ -592,45 +776,74 @@ def _candidate_host_pids() -> set[int]:
 
 
 def list_writable_datasets(user_id: str = "", *, timeout: float = 15.0) -> dict:
-    """Datasets this principal can switch to, from ``GET /api/v1/datasets``.
+    """Use effective permissions. Ownership cannot prove absence of write access.
 
-    The endpoint lists datasets the caller can READ; only those it OWNS are
-    guaranteed writable (creation grants read/write/share/delete). Returns::
+    ``GET /permissions/principals/{user}/datasets?permission_name=write`` lists
+    the caller's DIRECT write grants. A grant held through a role — shared agent
+    memory's ``cognee-agent`` role on the parent user's datasets — does not
+    appear there, so under a live shared-memory marker the parent's datasets
+    count as writable too. Without the permissions route (older server) the
+    owner match is the only evidence, and ``writable`` stays None when even that
+    cannot be judged. Returns::
 
         {"datasets": [{"name", "id", "owner_id", "writable": True|None}],
-         "hidden_readonly": N, "filtered": bool}
-
-    A dataset owned by someone else is dropped (counted in ``hidden_readonly``).
-    ``writable`` is None — and the row kept — when ownership cannot be judged:
-    no ``user_id`` to compare against, or a server whose DTO carries no owner
-    (pre-1.6 releases). ``filtered`` is True only when every row was judged, so
-    the caller can say whether the list is proven-writable or merely readable;
-    the switch itself still rejects a non-writable dataset loudly.
+         "readonly": [names], "readonly_ids": [ids], "hidden_readonly": N,
+         "filtered": bool}
     """
-    raw = _json_http_request("/api/v1/datasets", method="GET", timeout=timeout)
+    raw = _json_http_request("/api/v1/datasets/", method="GET", timeout=timeout)
     items = raw if isinstance(raw, list) else []
+    if not user_id:
+        me = _json_http_request("/api/v1/users/me", method="GET", timeout=timeout)
+        user_id = str(me.get("id") or "") if isinstance(me, dict) else ""
+    writable_ids = None
+    if user_id:
+        try:
+            allowed = _json_http_request(
+                f"/api/v1/permissions/principals/{urllib.parse.quote(user_id, safe='')}/datasets"
+                "?permission_name=write",
+                method="GET",
+                timeout=timeout,
+            )
+            if isinstance(allowed, list):
+                writable_ids = {str(row.get("id")) for row in allowed}
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (404, 405):
+                raise
+    shared_parent = ""
+    role_granted: dict = {}
+    shared = load_shared_memory_marker()
+    if shared_memory_enabled() and shared.get("mode") == "shared":
+        shared_parent = str(shared.get("parent_user_id") or "")
+        role_granted = shared.get("granted") if isinstance(shared.get("granted"), dict) else {}
     rows = []
     for item in items:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("name") or "").strip()
-        if not name:
-            continue
-        # OutDTO serialises camelCase on the wire (ownerId); accept both spellings.
-        owner = str(item.get("owner_id") or item.get("ownerId") or "").strip()
-        writable = None
-        if owner and user_id:
-            writable = owner == str(user_id)
-        rows.append(
-            {"name": name, "id": str(item.get("id") or ""), "owner_id": owner, "writable": writable}
+        owner = str(item.get("owner_id") or item.get("ownerId") or "")
+        ident = str(item.get("id") or "")
+        # Writable through the shared role only once the grant is confirmed —
+        # a transient failure leaves a parent-owned dataset ungranted until the
+        # next refresh, and it must not be offered as writable meanwhile.
+        via_role = (
+            bool(shared_parent) and owner == shared_parent and role_granted.get(ident) == "ok"
         )
-    rows.sort(key=lambda r: r["name"].lower())
-    kept = [r for r in rows if r["writable"] is not False]
+        if writable_ids is not None:
+            writable = ident in writable_ids or via_role
+        else:
+            writable = True if owner and (owner == user_id or via_role) else None
+        rows.append(
+            {
+                "name": str(item.get("name") or ""),
+                "id": ident,
+                "owner_id": owner,
+                "writable": writable,
+            }
+        )
+    rows.sort(key=lambda row: (row["name"].lower(), row["id"]))
     return {
-        "datasets": kept,
-        "readonly": [r["name"] for r in rows if r["writable"] is False],
-        "hidden_readonly": len(rows) - len(kept),
-        "filtered": bool(rows) and all(r["writable"] is not None for r in rows),
+        "datasets": [row for row in rows if row["writable"] is not False],
+        "readonly": [row["name"] for row in rows if row["writable"] is False],
+        "readonly_ids": [row["id"] for row in rows if row["writable"] is False],
+        "hidden_readonly": sum(row["writable"] is False for row in rows),
+        "filtered": writable_ids is not None,
     }
 
 
@@ -733,6 +946,8 @@ def load_resolved(session_key: str = "", *, identity: bool = True) -> dict:
     # The launch's active dataset (switchable) — read from the record so every
     # hook and worker follows a switch, not the shell it was launched from.
     resolved["dataset"] = resolve_active_dataset(active_session_key)
+    # Canonical UUIDs under shared agent memory (empty when name-addressed).
+    resolved["dataset_id"], resolved["dataset_ids"] = resolve_active_dataset_ids(active_session_key)
     conn_uuid = resolve_conn_uuid(active_session_key)
     if conn_uuid:
         resolved["agent_session_name"] = conn_uuid
@@ -1708,39 +1923,825 @@ def save_cached_api_key(service_url: str, key: str) -> None:
     )
 
 
-def _api_key() -> str:
-    """Resolve the single principal API key.
+def load_cached_agent_key(service_url: str = "") -> str:
+    """Return the provisioned plugin-agent key (matching service_url if recorded).
 
-    Single-principal model: one key for everything. Order:
-      1. ``COGNEE_API_KEY`` env (user-provided, or set in-process after minting).
-      2. The single cached key (``api_key.json``), minted once from the default
-         user by SessionStart when no key was provided.
-    No per-agent keys, no agent-name keying.
+    Empty string when the plugin has no provisioned identity — callers fall
+    back to the principal-key chain.
     """
-    env_key = str(os.environ.get("COGNEE_API_KEY", "") or "").strip()
-    if env_key:
-        return env_key
+    data = _load_json_file(_AGENT_KEY_CACHE)
+    if not isinstance(data, dict):
+        return ""
+    key = str(data.get("api_key") or "").strip()
+    if not key:
+        return ""
+    cached_url = _normalize_service_url(str(data.get("base_url") or ""))
+    wanted = _normalize_service_url(service_url)
+    if wanted and cached_url and cached_url != wanted:
+        return ""
+    return key
 
-    service_url = _normalize_service_url(_local_api_url())
-    cached = load_cached_api_key(service_url)
-    if cached:
-        os.environ["COGNEE_API_KEY"] = cached
-        return cached
 
+def load_cached_agent_id(service_url: str = "") -> str:
+    """The provisioned agent sub-user's id (recorded with its key), or ""."""
+    if not load_cached_agent_key(service_url):
+        return ""
+    data = _load_json_file(_AGENT_KEY_CACHE)
+    return str(data.get("agent_id") or "").strip() if isinstance(data, dict) else ""
+
+
+def save_cached_agent_key(
+    service_url: str, key: str, agent_id: str = "", *, principal_key: str = ""
+) -> None:
+    if not str(key or "").strip():
+        return
+    _write_credential(
+        {
+            "base_url": _normalize_service_url(service_url),
+            "api_key": str(key).strip(),
+            "agent_id": str(agent_id or ""),
+            "plugin_key": PLUGIN_KEY,
+            "principal_fingerprint": _principal_fingerprint(principal_key),
+            "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        },
+    )
+
+
+def clear_cached_agent_key() -> None:
+    """Drop the provisioned identity (revoked key / dashboard disconnect)."""
+    try:
+        _AGENT_KEY_CACHE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+# ── Shared agent memory ────────────────────────────────────────────────────
+#
+# A provisioned plugin agent is its own user, and cognee's grants only flow
+# child -> parent: the parent sees what the agent creates, the agent sees
+# nothing the parent (or a sibling agent) owns. Left alone, per-plugin
+# identities would silo memory — Codex could not recall what Claude Code
+# stored. Shared agent memory (the default; COGNEE_SHARED_AGENT_MEMORY=false
+# opts out into separated memory) closes that with the server's existing
+# permission model, no core changes:
+#
+#   1. the parent owns a tenant (created if it has none — roles only exist
+#      inside a tenant) and a role named AGENT_ROLE_NAME in it;
+#   2. every plugin agent is a member of that tenant and role;
+#   3. the role holds read+write on the parent's datasets (backfilled on every
+#      bootstrap/refresh, so datasets created later by any sibling converge);
+#   4. the launch's dataset is addressed by UUID: a canonical, parent-owned
+#      dataset per name that every agent writes to, plus any other readable
+#      same-named copies for recall (see resolve_active_dataset_ids).
+#
+# Every control-plane call below authenticates as the PRINCIPAL (tenant/role
+# management is owner-only server-side, so an agent key can never widen its
+# own access); only ``select_tenant`` runs as the agent, on itself.
+
+
+def shared_memory_enabled(config: dict | None = None) -> bool:
+    """Shared agent memory is on unless the user opted out.
+
+    ``COGNEE_SHARED_AGENT_MEMORY`` (env) wins over ``shared_agent_memory`` in
+    the config file; both default to on.
+    """
+    raw = str(os.environ.get("COGNEE_SHARED_AGENT_MEMORY", "") or "").strip()
+    if not raw and isinstance(config, dict) and config.get("shared_agent_memory") is not None:
+        raw = str(config.get("shared_agent_memory"))
+    if not raw:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def load_shared_memory_marker(service_url: str = "") -> dict:
+    """The shared-memory marker for ``service_url`` ({} when none / other URL)."""
+    data = _load_json_file(_SHARED_MEMORY_MARKER)
+    if not isinstance(data, dict):
+        return {}
+    wanted = _normalize_service_url(service_url or _local_api_url())
+    recorded = _normalize_service_url(str(data.get("base_url") or ""))
+    if wanted and recorded and wanted != recorded:
+        return {}
+    return data
+
+
+def _save_shared_memory_marker(marker: dict) -> None:
+    marker["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # A structural reason is only structural for THIS plugin version: an
+    # update may lift the limitation (e.g. once the server re-stamps
+    # tenant-less datasets), so SessionStart re-evaluates it after an update.
+    marker["plugin_version"] = _installed_plugin_version()
+    _write_json_file(_SHARED_MEMORY_MARKER, marker)
+
+
+def principal_key_for_control_plane(service_url: str = "") -> str:
+    """The PARENT user's key, for tenant/role/grant calls.
+
+    Never the provisioned agent key: ``_api_key_with_source`` stamps that one
+    into the env, so an env key equal to the cached agent key is the agent's,
+    not the user's. Falls through to the cached principal key (SessionStart
+    caches an env-provided principal when it provisions, so detached workers
+    can still act as the parent).
+    """
+    service_url = _normalize_service_url(service_url or _local_api_url())
+    agent_key = load_cached_agent_key(service_url)
+    for candidate in (
+        os.environ.get("COGNEE_PRINCIPAL_API_KEY", ""),
+        os.environ.get("COGNEE_API_KEY", ""),
+        load_cached_api_key(service_url),
+    ):
+        candidate = str(candidate or "").strip()
+        if candidate and candidate != agent_key:
+            return candidate
     return ""
+
+
+def active_agent_key(service_url: str = "") -> str:
+    """The cached plugin-agent key when it is the credential in force.
+
+    Cached for this server, not blocked, bound to the current principal, and
+    allowed by the identity mode — the same verdict the data plane reaches in
+    ``_api_key_with_source``. "" otherwise, never an exception: callers here
+    (shared-memory refresh, the shell skills) fall back to the principal.
+    """
+    try:
+        key, source = _api_key_with_source(service_url)
+    except RuntimeError:
+        return ""
+    return key if source == "plugin_agent_key" else ""
+
+
+def _control_plane_request(
+    path: str,
+    payload=None,
+    *,
+    api_key: str,
+    method: str = "POST",
+    timeout: float = 20.0,
+) -> tuple[int, object]:
+    """``_json_http_request`` that reports instead of raising: ``(status, body)``.
+
+    ``status`` is the HTTP status (200 for any 2xx), or 0 when the request never
+    got an HTTP answer (connection error, timeout).
+    """
+    try:
+        body = _json_http_request(path, payload, method=method, timeout=timeout, api_key=api_key)
+        return 200, body
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8")[:300]
+        except Exception:
+            pass
+        return exc.code, {"detail": detail}
+    except Exception as exc:
+        hook_log("control_plane_request_failed", {"path": path, "error": str(exc)[:200]})
+        return 0, {"error": str(exc)[:200]}
+
+
+def _accepted(status: int) -> bool:
+    """A 2xx, or a 409 — the server's "already exists" for idempotent adds."""
+    return status == 200 or status == 409
+
+
+def _row_str(row: dict, *keys: str) -> str:
+    """First non-empty of several spellings (OutDTOs answer camelCase)."""
+    for key in keys:
+        value = row.get(key)
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def user_me_via_http(api_key: str) -> dict:
+    """``{"id", "tenant_id"}`` for the key's user, or {} (absent /users/me on some tenants)."""
+    status, body = _control_plane_request(
+        "/api/v1/users/me", api_key=api_key, method="GET", timeout=10.0
+    )
+    if status != 200 or not isinstance(body, dict):
+        return {}
+    return {
+        "id": _row_str(body, "id"),
+        "tenant_id": _row_str(body, "tenant_id", "tenantId"),
+    }
+
+
+def list_datasets_via_http(api_key: str, *, timeout: float = 15.0) -> list[dict]:
+    """Every dataset the key can READ: ``[{"id", "name", "owner_id", "created_at"}]``."""
+    status, body = _control_plane_request(
+        "/api/v1/datasets", api_key=api_key, method="GET", timeout=timeout
+    )
+    if status != 200 or not isinstance(body, list):
+        return []
+    rows = []
+    for item in body:
+        if not isinstance(item, dict):
+            continue
+        dataset_id = _row_str(item, "id")
+        name = _row_str(item, "name")
+        if dataset_id and name:
+            rows.append(
+                {
+                    "id": dataset_id,
+                    "name": name,
+                    "owner_id": _row_str(item, "owner_id", "ownerId"),
+                    "created_at": _row_str(item, "created_at", "createdAt"),
+                }
+            )
+    return rows
+
+
+def create_dataset_via_http(api_key: str, name: str) -> dict:
+    """POST /api/v1/datasets/ as ``api_key``: the (new or existing) dataset row, or {}."""
+    # Trailing slash on purpose: cloud tenants 307-redirect the bare path and
+    # urllib will not replay a POST across a redirect.
+    status, body = _control_plane_request(
+        "/api/v1/datasets/", {"name": name}, api_key=api_key, timeout=30.0
+    )
+    if status != 200 or not isinstance(body, dict):
+        return {}
+    dataset_id = _row_str(body, "id")
+    return {"id": dataset_id, "name": _row_str(body, "name") or name} if dataset_id else {}
+
+
+def _permissions_supported(principal_key: str) -> bool:
+    """Does this server expose the permissions API (tenants/roles/grants)?
+
+    Probed on the one endpoint that cannot 404 for any other reason: several
+    permission routes answer 404 for a *missing tenant* (TenantNotFoundError),
+    so a 404 elsewhere is not a capability verdict.
+    """
+    status, _ = _control_plane_request(
+        "/api/v1/permissions/tenants/me", api_key=principal_key, method="GET", timeout=10.0
+    )
+    return status not in (404, 405)
+
+
+def _typed_dataset_ids_supported(api_key: str) -> bool:
+    """Shared memory stores session entries by dataset UUID; an SDK that
+    advertises ``dataset_id`` but rejects it at runtime cannot host it (see
+    ``require_typed_dataset_id_support``)."""
+    try:
+        require_typed_dataset_id_support(api_key=api_key)
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_tenant(principal_key: str, parent: dict, datasets: list[dict]) -> tuple[str, str]:
+    """Resolve the tenant the shared role lives in: ``(tenant_id, reason)``.
+
+    The parent's active tenant when it has one. A tenant-less parent (the OSS
+    default user) gets one created — but only when no dataset it can read
+    exists yet: activating a tenant re-scopes dataset visibility to that
+    tenant, which would hide every dataset created under no tenant — the
+    parent's own, and (since the agent selects the tenant too) any an agent
+    already created under name addressing. Such installs stay on separated
+    memory (reason ``tenantless_with_data``).
+    """
+    tenant_id = str(parent.get("tenant_id") or "")
+    if tenant_id:
+        return tenant_id, ""
+    parent_id = str(parent.get("id") or "")
+    if datasets:
+        return "", "tenantless_with_data"
+    status, body = _control_plane_request(
+        f"/api/v1/permissions/tenants?tenant_name={urllib.parse.quote(f'cognee-{parent_id[:8]}')}",
+        api_key=principal_key,
+    )
+    if status != 200 or not isinstance(body, dict):
+        hook_log("shared_memory_tenant_create_failed", {"status": status})
+        return "", "tenant_create_failed"
+    return _row_str(body, "tenant_id", "tenantId"), ""
+
+
+def _ensure_role(principal_key: str, tenant_id: str) -> tuple[str, str]:
+    """Get-or-create AGENT_ROLE_NAME in ``tenant_id``: ``(role_id, reason)``."""
+
+    def _find() -> str:
+        status, body = _control_plane_request(
+            f"/api/v1/permissions/tenants/{tenant_id}/roles",
+            api_key=principal_key,
+            method="GET",
+            timeout=10.0,
+        )
+        if status == 200 and isinstance(body, list):
+            for row in body:
+                if isinstance(row, dict) and _row_str(row, "name") == AGENT_ROLE_NAME:
+                    return _row_str(row, "id")
+        return ""
+
+    role_id = _find()
+    if role_id:
+        return role_id, ""
+    status, body = _control_plane_request(
+        f"/api/v1/permissions/roles?role_name={urllib.parse.quote(AGENT_ROLE_NAME)}",
+        api_key=principal_key,
+    )
+    if status == 200 and isinstance(body, dict) and _row_str(body, "role_id", "roleId"):
+        return _row_str(body, "role_id", "roleId"), ""
+    if status == 409:
+        return _find(), ""
+    if status in (401, 403):
+        # Only the tenant owner may create roles: an org member on a shared
+        # tenant cannot run shared memory — stay separated rather than fail.
+        return "", "not_tenant_owner"
+    hook_log("shared_memory_role_create_failed", {"status": status})
+    return "", "role_create_failed"
+
+
+def _add_agent_to_tenant_and_role(
+    principal_key: str, agent_key: str, agent_id: str, tenant_id: str, role_id: str
+) -> str:
+    """Membership wiring for one agent; returns a failure reason or ""."""
+    status, _ = _control_plane_request(
+        f"/api/v1/permissions/users/{agent_id}/tenants?tenant_id={tenant_id}",
+        api_key=principal_key,
+    )
+    if not _accepted(status):
+        return "not_tenant_owner" if status in (401, 403) else "tenant_membership_failed"
+    # The agent selects the tenant ITSELF: membership alone doesn't set its
+    # active tenant, and the dataset-visibility filter compares against that.
+    # create_agent copies the parent's tenant at provision time, so this is a
+    # no-op there; it matters when the tenant was created after provisioning —
+    # the fresh-install path, where the agent is provisioned first. Without it
+    # every grant that follows is invisible to the agent, so a failure here is
+    # a wiring failure (retried on the next launch), not a warning.
+    status, _ = _control_plane_request(
+        "/api/v1/permissions/tenants/select", {"tenant_id": tenant_id}, api_key=agent_key
+    )
+    if status != 200:
+        hook_log("shared_memory_agent_select_tenant_failed", {"status": status})
+        return "agent_tenant_select_failed"
+    status, _ = _control_plane_request(
+        f"/api/v1/permissions/users/{agent_id}/roles?role_id={role_id}",
+        api_key=principal_key,
+    )
+    if not _accepted(status):
+        return "not_tenant_owner" if status in (401, 403) else "role_membership_failed"
+    return ""
+
+
+def _remove_agent_from_role(principal_key: str, agent_id: str, role_id: str) -> bool:
+    """Take the agent out of the shared role (opt-out). True when it is no
+    longer a member — including when it already wasn't (404)."""
+    if not (principal_key and agent_id and role_id):
+        return False
+    status, _ = _control_plane_request(
+        f"/api/v1/permissions/users/{agent_id}/roles?role_id={role_id}",
+        api_key=principal_key,
+        method="DELETE",
+    )
+    if status not in (200, 404):
+        hook_log("shared_memory_leave_role_failed", {"status": status})
+        return False
+    return True
+
+
+_GRANT_DENIED_RETRY_SECONDS = 3600.0
+
+
+def _grant_role_on_datasets(
+    principal_key: str, role_id: str, dataset_ids: list[str], marker: dict
+) -> set[str]:
+    """Give the role read+write on each dataset (one call per dataset, so a
+    single unshareable one — e.g. read-only shared by someone else — cannot
+    fail the batch). Outcomes are memoised in ``marker["granted"]``:
+    ``"ok"`` never retried, a denial retried hourly and logged when it is
+    new. Returns the ids the role holds read+write on."""
+    granted = marker.setdefault("granted", {})
+    if not isinstance(granted, dict):
+        granted = marker["granted"] = {}
+    now = time.time()
+    for dataset_id in dataset_ids:
+        prior = granted.get(dataset_id)
+        if prior == "ok":
+            continue
+        if isinstance(prior, dict) and now - float(prior.get("denied_at") or 0) < (
+            _GRANT_DENIED_RETRY_SECONDS
+        ):
+            continue
+        outcome = "ok"
+        for permission in ("read", "write"):
+            status, _ = _control_plane_request(
+                f"/api/v1/permissions/datasets/{role_id}?permission_name={permission}",
+                [dataset_id],
+                api_key=principal_key,
+            )
+            if status in (401, 403):
+                outcome = {"denied_at": now}
+                if not isinstance(prior, dict):
+                    # Typically a dataset shared to the user read-only by someone
+                    # else: the user cannot share it on, so the agents cannot
+                    # reach it. Said once per dataset, not once per hour.
+                    hook_log(
+                        "shared_memory_grant_denied",
+                        {"dataset_id": dataset_id, "permission": permission, "status": status},
+                    )
+                break
+            if status != 200:
+                outcome = None  # transient: retry next time
+                break
+        if outcome is None:
+            granted.pop(dataset_id, None)
+            continue
+        granted[dataset_id] = outcome
+    return {dataset_id for dataset_id, outcome in granted.items() if outcome == "ok"}
+
+
+def _pick_canonical(rows: list[dict], parent_id: str) -> dict:
+    """The canonical dataset among same-named rows: the parent's own copy,
+    else the oldest (deterministic across plugins, so siblings converge)."""
+    for row in rows:
+        if row["owner_id"] and row["owner_id"] == parent_id:
+            return row
+    return sorted(rows, key=lambda r: (r["created_at"] or "9", r["id"]))[0]
+
+
+def ensure_shared_memory(
+    *,
+    service_url: str,
+    principal_key: str,
+    agent_key: str,
+    agent_id: str,
+    dataset: str = "",
+    allow_setup: bool = True,
+    config: dict | None = None,
+) -> dict:
+    """Wire (or refresh) shared agent memory for this plugin's agent.
+
+    Returns ``{"mode": "shared"|"separated", "reason", "dataset_id",
+    "dataset_ids", "role_id"}``. ``dataset_id`` is the canonical UUID to write
+    ``dataset`` under and ``dataset_ids`` the UUIDs to recall from; both empty
+    when separated (callers keep addressing the dataset by name).
+
+    ``allow_setup=False`` (the idle watcher's periodic refresh) only re-resolves
+    the canonical dataset and backfills grants against wiring SessionStart
+    already completed — it never creates tenants or roles. Every step degrades
+    to separated memory with a logged reason; nothing here can fail a session.
+    """
+    service_url = _normalize_service_url(service_url or _local_api_url())
+
+    def _separated(reason: str) -> dict:
+        return {
+            "mode": "separated",
+            "reason": reason,
+            "dataset_id": "",
+            "dataset_ids": [],
+            "role_id": "",
+        }
+
+    if not shared_memory_enabled(config):
+        # Opting out is a real boundary, not just an addressing change: the
+        # agent LEAVES the shared role, so it can no longer read or write the
+        # user's datasets (its own remain). The marker is demoted so nothing
+        # (dataset_id_for, the switch listing, the doctor) keeps treating the
+        # wiring as active, but the tenant / role / parent ids are kept —
+        # re-enabling puts the agent back into the same role and canonical
+        # dataset instead of creating new ones. Runs as the principal (role
+        # management is owner-only); retried on the next launch if it fails.
+        marker = load_shared_memory_marker(service_url)
+        if marker.get("mode") == "shared":
+            removed = _remove_agent_from_role(
+                principal_key,
+                str(marker.get("agent_id") or agent_id),
+                str(marker.get("role_id") or ""),
+            )
+            if removed:
+                _save_shared_memory_marker(
+                    {**marker, "mode": "separated", "reason": "opt_out", "role_member": False}
+                )
+            hook_log(
+                "shared_memory_opted_out", {"role_id": marker.get("role_id"), "left_role": removed}
+            )
+        return _separated("opt_out")
+    if not (principal_key and agent_key and agent_id):
+        return _separated("no_agent_identity")
+
+    marker = load_shared_memory_marker(service_url)
+    wired = (
+        marker.get("mode") == "shared"
+        and marker.get("agent_id") == agent_id
+        and bool(marker.get("role_id"))
+        and bool(marker.get("parent_user_id"))
+    )
+    if not wired and not allow_setup:
+        return _separated(str(marker.get("reason") or "not_wired"))
+
+    datasets: list[dict] | None = None
+    if not wired:
+        if not _permissions_supported(principal_key):
+            _save_shared_memory_marker(
+                {"base_url": service_url, "mode": "separated", "reason": "unsupported"}
+            )
+            hook_log("shared_memory_skipped", {"reason": "unsupported"})
+            return _separated("unsupported")
+        if not _typed_dataset_ids_supported(principal_key):
+            _save_shared_memory_marker(
+                {
+                    "base_url": service_url,
+                    "mode": "separated",
+                    "reason": "typed_dataset_unsupported",
+                }
+            )
+            hook_log("shared_memory_skipped", {"reason": "typed_dataset_unsupported"})
+            return _separated("typed_dataset_unsupported")
+        parent = user_me_via_http(principal_key)
+        if not parent.get("id"):
+            return _separated("principal_unresolved")
+        datasets = list_datasets_via_http(principal_key)
+        tenant_id, reason = _ensure_tenant(principal_key, parent, datasets)
+        role_id = ""
+        if not reason:
+            role_id, reason = _ensure_role(principal_key, tenant_id)
+        if not reason:
+            reason = _add_agent_to_tenant_and_role(
+                principal_key, agent_key, agent_id, tenant_id, role_id
+            )
+        if reason:
+            _save_shared_memory_marker(
+                {"base_url": service_url, "mode": "separated", "reason": reason}
+            )
+            hook_log("shared_memory_skipped", {"reason": reason})
+            return _separated(reason)
+        marker = {
+            "base_url": service_url,
+            "mode": "shared",
+            "reason": "",
+            "tenant_id": tenant_id,
+            "role_id": role_id,
+            "parent_user_id": parent["id"],
+            "agent_id": agent_id,
+            "granted": {},
+            "canonical": {},
+        }
+        hook_log(
+            "shared_memory_wired",
+            {"tenant_id": tenant_id, "role_id": role_id, "agent_id": agent_id},
+        )
+
+    parent_id = str(marker.get("parent_user_id") or "")
+    role_id = str(marker.get("role_id") or "")
+    if datasets is None:
+        datasets = list_datasets_via_http(principal_key)
+
+    # Backfill: the role gets read+write on everything the parent can share.
+    # Datasets a sibling agent creates are auto-shared to the parent, so this
+    # is also how they reach every other agent — no per-plugin coordination.
+    role_holds = _grant_role_on_datasets(
+        principal_key, role_id, [row["id"] for row in datasets], marker
+    )
+
+    # The launch's dataset: a canonical copy every agent writes to, plus other
+    # same-named copies for recall. Only datasets the role actually holds (or
+    # the parent owns) qualify — a same-named dataset shared to the user
+    # read-only by someone else cannot be granted on, so it is neither the
+    # write target nor part of the recall set (one unreadable id would fail the
+    # whole recall). With no eligible copy the parent creates its own.
+    write_id, read_ids = "", []
+    if dataset:
+        same_name = [row for row in datasets if row["name"] == dataset]
+        eligible = [
+            row for row in same_name if row["owner_id"] == parent_id or row["id"] in role_holds
+        ]
+        if not eligible:
+            created = create_dataset_via_http(principal_key, dataset)
+            if not created.get("id"):
+                # The wiring itself is fine (the marker keeps its grants), but
+                # this launch has no canonical UUID to address. Report that
+                # rather than "shared" with an empty dataset_id, which would
+                # fall back to name addressing and quietly write to an
+                # agent-owned copy nobody else can see.
+                _save_shared_memory_marker(marker)
+                hook_log(
+                    "shared_memory_skipped",
+                    {"reason": "dataset_create_failed", "dataset": dataset},
+                )
+                return _separated("dataset_create_failed")
+            created = {**created, "owner_id": parent_id, "created_at": ""}
+            same_name.append(created)
+            datasets.append(created)
+            role_holds |= _grant_role_on_datasets(principal_key, role_id, [created["id"]], marker)
+            eligible = [created]
+        if eligible:
+            write_id = _pick_canonical(eligible, parent_id)["id"]
+            canonical = marker.setdefault("canonical", {})
+            if isinstance(canonical, dict):
+                canonical[dataset] = write_id
+            read_ids = [write_id] + [
+                row["id"]
+                for row in same_name
+                if row["id"] != write_id
+                and (row["id"] in role_holds or row["owner_id"] == agent_id)
+            ]
+    _save_shared_memory_marker(marker)
+    return {
+        "mode": "shared",
+        "reason": "",
+        "dataset_id": write_id,
+        "dataset_ids": read_ids,
+        "role_id": role_id,
+    }
+
+
+def resolve_shared_dataset(dataset: str, *, allow_setup: bool = False) -> dict:
+    """``ensure_shared_memory`` for an already-wired agent, from any process.
+
+    Resolves the keys itself (principal for the control plane, cached agent
+    identity), so the dataset switch and the idle watcher can re-resolve a
+    dataset's canonical UUIDs and backfill grants without SessionStart's
+    context. Returns the same outcome dict; ``mode == "separated"`` when
+    shared memory is off, unwired, or the keys are unavailable.
+    """
+    service_url = _normalize_service_url(_local_api_url())
+    outcome = {
+        "mode": "separated",
+        "reason": "not_wired",
+        "dataset_id": "",
+        "dataset_ids": [],
+        "role_id": "",
+    }
+    if not shared_memory_enabled():
+        return {**outcome, "reason": "opt_out"}
+    principal_key = principal_key_for_control_plane(service_url)
+    agent_key = active_agent_key(service_url)
+    agent_id = load_cached_agent_id(service_url)
+    if not (principal_key and agent_key and agent_id):
+        return {**outcome, "reason": "no_agent_identity" if not agent_key else "no_principal_key"}
+    return ensure_shared_memory(
+        service_url=service_url,
+        principal_key=principal_key,
+        agent_key=agent_key,
+        agent_id=agent_id,
+        dataset=dataset,
+        allow_setup=allow_setup,
+    )
+
+
+def refresh_shared_memory(host_key: str = "") -> bool:
+    """Periodic refresh for a running launch (idle watcher).
+
+    Re-resolves the active dataset's canonical UUIDs — a sibling plugin may
+    have created a same-named copy or a brand-new dataset since this launch
+    started — and backfills the shared role's grants, so new datasets become
+    visible to every agent within one refresh interval instead of at the next
+    session start. Returns True when the launch record was updated.
+    """
+    host_key = _sanitize_session_key(host_key) or get_session_key()
+    if not host_key or not _read_map_record(host_key):
+        return False
+    dataset = resolve_active_dataset(host_key)
+    shared = resolve_shared_dataset(dataset)
+    if shared["mode"] != "shared" or not shared["dataset_id"]:
+        return False
+    # ``dataset=`` pins the ids to the dataset they were resolved for: a switch
+    # that completed during the resolution above leaves the record untouched.
+    return set_launch_dataset_ids(
+        host_key, shared["dataset_id"], shared["dataset_ids"], dataset=dataset
+    )
+
+
+def plugin_identity_mode(config: dict | None = None) -> str:
+    value = (config or {}).get("plugin_identity", os.environ.get("COGNEE_PLUGIN_IDENTITY", "auto"))
+    if value is None or str(value).strip().lower() == "auto":
+        return "auto"
+    normalized = str(value).strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return "enabled"
+    if normalized in ("0", "false", "no", "off"):
+        return "disabled"
+    raise ValueError("COGNEE_PLUGIN_IDENTITY must be auto, true, or false")
+
+
+def _principal_fingerprint(key: str) -> str:
+    return hashlib.sha256(key.encode()).hexdigest() if key else ""
+
+
+@contextmanager
+def plugin_identity_lock(timeout: float = 25.0):
+    """Fail closed; an OS lock is released even if a bootstrap process dies."""
+    path = _AGENT_KEY_CACHE.with_suffix(".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    locked = False
+    try:
+        # Windows permits locking beyond EOF. Writing here would fail when
+        # another process holds the byte lock, before our retry loop runs.
+        deadline = time.monotonic() + timeout
+        while not locked:
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Timed out waiting for plugin identity bootstrap") from None
+                time.sleep(0.05)
+        yield
+    finally:
+        if locked:
+            if os.name == "nt":
+                import msvcrt
+
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def block_cached_agent_key(expected_key: str) -> None:
+    with plugin_identity_lock():
+        data = _load_json_file(_AGENT_KEY_CACHE)
+        # A concurrent explicit reconnect may already have replaced this key.
+        if data.get("api_key") == expected_key:
+            data["blocked"] = True
+            _write_credential(data)
+
+
+def _write_credential(data: dict) -> None:
+    _AGENT_KEY_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = _AGENT_KEY_CACHE.with_name(f"agent_key.{uuid.uuid4().hex}.tmp")
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(data, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, _AGENT_KEY_CACHE)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _api_key_with_source(service_url: str = "") -> tuple[str, str]:
+    """Select a bound agent credential without replacing the principal in env."""
+    service_url = _normalize_service_url(service_url or _local_api_url())
+    agent_key = load_cached_agent_key(service_url)
+    env_key = str(os.environ.get("COGNEE_API_KEY", "") or "").strip()
+    principal = str(os.environ.get("COGNEE_PRINCIPAL_API_KEY", "") or "").strip()
+    if env_key and env_key != agent_key:
+        principal = env_key
+    principal = principal or load_cached_api_key(service_url)
+    mode = plugin_identity_mode()
+    if agent_key and mode != "disabled":
+        record = _load_json_file(_AGENT_KEY_CACHE)
+        problem = ""
+        if record.get("blocked"):
+            problem = "Plugin identity was rejected; reconnect explicitly (no automatic rotation)"
+        elif not principal or record.get("principal_fingerprint") != _principal_fingerprint(
+            principal
+        ):
+            problem = "Plugin identity belongs to another or unverified principal; run SessionStart"
+        if not problem:
+            return agent_key, "plugin_agent_key"
+        # A rejected or foreign identity is never used. Explicit identity
+        # (``true``) makes that an error; ``auto`` — identity only in service
+        # of shared memory — keeps the plugin working as the principal. With
+        # no principal to fall back to, ``auto`` must not run keyless either:
+        # that would fail every request quietly instead of naming the cause.
+        if mode == "enabled" or not principal:
+            raise RuntimeError(
+                problem
+                if principal
+                else problem + " — and no principal key is available (COGNEE_API_KEY unset)"
+            )
+    if mode == "enabled":
+        raise RuntimeError("Plugin identity is enabled but not connected; run SessionStart")
+    if principal:
+        return principal, "env_api_key" if principal in (
+            env_key,
+            os.environ.get("COGNEE_PRINCIPAL_API_KEY"),
+        ) else "cache_single_key"
+    return "", "missing"
+
+
+def _api_key() -> str:
+    return _api_key_with_source()[0]
 
 
 def resolved_http_endpoint_auth() -> tuple[str, str]:
     """Return (service_url, api_key) for runtime HTTP calls.
 
-    Service URL falls back through plugin config before localhost. API key is
-    the single principal key: env first, then the single cached key.
+    Service URL falls back through plugin config before localhost. Export the
+    effective key for child processes while preserving the explicit principal.
     """
     service_url = _normalize_service_url(_local_api_url())
     api_key = _api_key().strip()
     if service_url:
         os.environ["COGNEE_BASE_URL"] = service_url
     if api_key:
+        previous = str(os.environ.get("COGNEE_API_KEY", "") or "").strip()
+        if previous and previous != api_key:
+            os.environ["COGNEE_PRINCIPAL_API_KEY"] = previous
         os.environ["COGNEE_API_KEY"] = api_key
     return service_url, api_key
 
@@ -2912,12 +3913,15 @@ def _json_http_request(
     method: str = "POST",
     timeout: float = 30.0,
     base_url: str | None = None,
+    api_key: str | None = None,
 ):
     # base_url overrides the resolved service URL for calls that target a
     # different host than the memory data plane (e.g. the cloud platform API's
-    # billing routes); the same principal X-Api-Key is attached either way.
+    # billing routes). api_key overrides the resolved key for calls that must
+    # authenticate as a specific identity (e.g. plugin provisioning runs as
+    # the principal, never as the provisioned agent).
     base_url = (base_url or _local_api_url()).rstrip("/")
-    api_key = _api_key()
+    api_key = api_key if api_key is not None else _api_key()
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["X-Api-Key"] = api_key
@@ -3020,17 +4024,45 @@ def wait_for_cognify(
         time.sleep(max(0.1, interval_seconds))  # floor avoids a tight spin if misconfigured to 0
 
 
+_TYPED_DATASET_CAPABILITIES = {}
+
+
+def require_typed_dataset_id_support(*, service_url: str = "", api_key=None) -> None:
+    """Old SDKs advertise dataset_id but reject typed entries at runtime."""
+    url = _normalize_service_url(service_url or _local_api_url())
+    cached = _TYPED_DATASET_CAPABILITIES.get(url)
+    supported = cached[1] if cached else False
+    if cached is None or time.monotonic() - cached[0] > 60.0:
+        spec = _json_http_request("/openapi.json", method="GET", base_url=url, api_key=api_key)
+        supported = (
+            spec.get("paths", {})
+            .get("/api/v1/remember/entry", {})
+            .get("post", {})
+            .get("x-cognee-session-dataset-ids")
+            is True
+        )
+        _TYPED_DATASET_CAPABILITIES[url] = (time.monotonic(), supported)
+    if not supported:
+        raise RuntimeError(
+            "This Cognee server cannot safely store typed session memory by dataset UUID. "
+            "Update the SDK before selecting a shared write dataset."
+        )
+
+
 def remember_entry_via_http(
     dataset: str,
     session_id: str,
     entry: dict,
     *,
+    dataset_id: str | None = None,
     timeout: float = 30.0,
 ) -> dict | None:
     """Store a typed QA/trace entry through the backend API.
 
     API-mode hooks use this instead of importing Cognee's Python client,
     so they don't initialize local databases while talking to a backend.
+    ``dataset_id`` (the canonical UUID under shared memory; resolved from
+    ``dataset`` when not given) takes precedence server-side over the name.
     """
     if not dataset or not session_id:
         return None
@@ -3038,16 +4070,19 @@ def remember_entry_via_http(
 
     target = route(dataset, session_id)
     dataset = target["write"]
+    if parse_dataset_id(dataset):
+        require_typed_dataset_id_support()
     entry = _sanitize_value(entry)
     if target.get("node_set") and entry.get("type") in ("qa", "trace"):
         entry = {**entry, "node_set": target["node_set"]}
+    # The canonical UUID under shared memory (explicit, or resolved from the
+    # launch record) wins: a name only resolves among datasets the caller owns.
+    # Otherwise a UUID-shaped dataset is sent as an id and a name as a name.
+    resolved_id = dataset_id if dataset_id is not None else dataset_id_for(dataset)
+    fields = {"dataset_id": resolved_id} if resolved_id else write_fields(dataset)
     return _json_http_request(
         "/api/v1/remember/entry",
-        {
-            "entry": entry,
-            "dataset_name": dataset,
-            "session_id": session_id,
-        },
+        {"entry": entry, **fields, "session_id": session_id},
         timeout=timeout,
     )
 
@@ -3105,23 +4140,143 @@ def write_outcome_ambiguous(exc: Exception) -> bool:
     return True
 
 
+def disconnect_plugin_agent_via_http(*, principal_key: str, timeout: float = 20.0) -> bool:
+    """DELETE /api/v1/integrations/plugins/{PLUGIN_KEY}: revoke this plugin's agent keys.
+
+    The agent user and its data stay (re-provisioning later revives the same
+    identity with a fresh key). Used when SessionStart discards a key it just
+    minted, so no valid key nobody holds is left behind. Best-effort.
+    """
+    if not str(principal_key or "").strip():
+        return False
+    status, _ = _control_plane_request(
+        f"/api/v1/integrations/plugins/{PLUGIN_KEY}",
+        api_key=principal_key,
+        method="DELETE",
+        timeout=timeout,
+    )
+    if status != 200:
+        hook_log("plugin_disconnect_failed", {"status": status})
+    return status == 200
+
+
+def provision_plugin_agent_via_http(
+    *,
+    principal_key: str,
+    service_url: str = "",
+    timeout: float = 20.0,
+) -> tuple[str, dict]:
+    """Create this plugin's identity without rotating an existing key.
+
+    Authenticate as the user principal and require the server's advertised
+    create_only contract before POSTing. OpenAPI is a capability declaration;
+    its enforcement is covered by the SDK's provisioning regression tests.
+    Unsupported/failed provisioning must fail closed in the caller.
+    """
+    if not str(principal_key or "").strip():
+        return "failed", {}
+    try:
+        # Older servers ignore unknown query parameters and rotate keys. Verify
+        # the create-only contract BEFORE sending any provisioning request.
+        spec = _json_http_request(
+            "/openapi.json",
+            method="GET",
+            api_key=principal_key,
+            base_url=service_url or _local_api_url(),
+            timeout=timeout,
+        )
+        operation = (
+            spec.get("paths", {})
+            .get("/api/v1/integrations/plugins/{plugin_key}/provision", {})
+            .get("post", {})
+        )
+        if not any(
+            p.get("name") == "create_only" and p.get("in") == "query"
+            for p in operation.get("parameters", [])
+        ):
+            return "unsupported", {}
+        result = _json_http_request(
+            f"/api/v1/integrations/plugins/{PLUGIN_KEY}/provision?create_only=true",
+            {},
+            method="POST",
+            timeout=timeout,
+            api_key=principal_key,
+            base_url=service_url or _local_api_url(),
+        )
+        reason = "not_an_object"
+        if isinstance(result, dict):
+            body = {
+                "api_key": str(result.get("api_key") or result.get("apiKey") or "").strip(),
+                "agent_id": str(result.get("agent_id") or result.get("agentId") or ""),
+                "created": bool(result.get("created")),
+            }
+            if not (body["api_key"] and body["created"]):
+                reason = "incomplete"
+            elif not body["agent_id"]:
+                # Shared memory wires the agent by id; without one the launch
+                # would provision, then report ``no_agent_identity``.
+                reason = "missing_agent_id"
+            elif body["api_key"] == str(principal_key or "").strip():
+                # The caller's own key handed back as the "agent" key: no
+                # isolation at all, and the principal resolvers skip whatever
+                # the agent cache holds, so the launch would end up keyless.
+                reason = "agent_key_equals_principal"
+            else:
+                return "provisioned", body
+        hook_log(
+            "plugin_provision_bad_response",
+            {
+                "reason": reason,
+                "keys": sorted(result) if isinstance(result, dict) else str(type(result)),
+            },
+        )
+        return "failed", {}
+    except urllib.error.HTTPError as exc:
+        # 404/405: the server predates plugin provisioning (or the route set
+        # differs) — a capability verdict, not a fault.
+        if exc.code in (404, 405):
+            return "unsupported", {}
+        hook_log("plugin_provision_failed", {"status": exc.code, "error": str(exc)[:200]})
+        return "failed", {}
+    except Exception as exc:
+        hook_log("plugin_provision_failed", {"error": str(exc)[:200]})
+        return "failed", {}
+
+
 def register_agent_via_http(
     *,
     agent_session_name: str,
     session_id: str = "",
     dataset_names: list[str] | None = None,
+    dataset_ids: list[str] | None = None,
     timeout: float = 15.0,
 ) -> tuple[bool, dict]:
     payload = {
         "agent_session_name": agent_session_name,
-        "type": "api",
+        # Self-declared connection type (the server keeps a free-form registry;
+        # "codex" is one of its documented KNOWN_AGENT_CONNECTION_TYPES).
+        "type": CONNECTION_TYPE,
         "memory_mode": "hybrid",
         "source": "api",
     }
     if session_id:
         payload["session_id"] = session_id
     if dataset_names:
-        payload["dataset_names"] = [str(name) for name in dataset_names if str(name).strip()]
+        payload["dataset_names"] = [
+            str(name) for name in dataset_names if str(name).strip() and not parse_dataset_id(name)
+        ]
+        ids = [parse_dataset_id(name) for name in dataset_names if parse_dataset_id(name)]
+        if ids:
+            payload["dataset_ids"] = ids
+    if dataset_ids:
+        # The canonical dataset under shared memory — bound by UUID so the
+        # connection registry points at the dataset actually written to.
+        payload["dataset_ids"] = list(
+            dict.fromkeys(
+                [*payload.get("dataset_ids", [])]
+                + [str(x).strip() for x in dataset_ids if str(x).strip()]
+            )
+        )
 
     try:
         result = _json_http_request(
@@ -3133,10 +4288,14 @@ def register_agent_via_http(
     except Exception as exc:
         status = exc.code if isinstance(exc, urllib.error.HTTPError) else None
         if status == 404:
+            # The lifecycle routes are optional server-side: a missing register
+            # route is a capability verdict, not a failed session.
             hook_log("agent_lifecycle_unsupported", {"operation": "register", "status": status})
             return False, {"lifecycle_supported": False}
         hook_log("agent_register_failed", {"error": str(exc)[:200], "status": status})
-        return False, {"status_code": status}
+        # status_code lets SessionStart raise a classified HTTPError; auth_failed
+        # lets it block a revoked plugin-agent key instead of failing outright.
+        return False, {"status_code": status, "auth_failed": status in (401, 403)}
 
 
 def unregister_agent_via_http(
@@ -3171,6 +4330,7 @@ def recall_via_http(
     search_type: str | None = None,
     context_profile: str | None = None,
     dataset: str = "",
+    dataset_ids: list[str] | None = None,
     code_query: dict | None = None,
     timeout: float = 10.0,
 ) -> list:
@@ -3189,28 +4349,46 @@ def recall_via_http(
     # readable dataset and then reconciles against the session's binding, so the
     # graph scope depends on that binding existing: an unbound session with more
     # than one readable dataset is rejected as ambiguous rather than searched.
-    # Naming the dataset makes the scope explicit and matches the explicit-search
-    # path (_recall_http.do_recall), which has always sent it. The value must be
-    # the dataset the session's entries were written under — a different one is a
-    # binding mismatch server-side, which is a real error worth surfacing.
-    if dataset:
-        payload["datasets"] = [dataset]
-    if search_type:
-        payload["search_type"] = search_type
-    if context_profile:
-        payload["context_profile"] = context_profile
+    # The value must be the dataset the session's entries were written under — a
+    # different one is a binding mismatch server-side, a real error worth surfacing.
+    # Project memory may route this session's writes to a companion dataset; the
+    # recall scope follows that routing (the primary is searched separately below).
     from _deadlines import bounded_call
     from _project_memory import route
 
     target = route(dataset, session_id) if dataset and not code_query else {"write": dataset}
-    if dataset:
-        payload["datasets"] = [target["write"]]
+    write_dataset = target["write"]
+    # Three sources of scope, in precedence order:
+    #   1. COGNEE_PLUGIN_READ_DATASET_IDS on a graph-only recall: the user's own
+    #      federated read set. Session history stays bound to ONE dataset, so
+    #      the session id is dropped from that request.
+    #   2. ``dataset_ids`` resolved by shared agent memory (the canonical
+    #      parent-owned dataset plus readable same-named copies): a name only
+    #      resolves among datasets the caller OWNS, which under a plugin
+    #      identity is not the dataset the agent was granted.
+    #   3. The (routed) dataset itself: sent as an id when UUID-shaped, else
+    #      by name.
+    fields, federated = recall_fields(write_dataset, scope)
+    ids = [str(x).strip() for x in (dataset_ids or []) if str(x).strip()]
+    if federated:
+        payload.update(fields)
+        payload.pop("session_id", None)
+    elif ids and write_dataset == dataset:
+        # Shared-memory ids describe the primary dataset; a companion-routed
+        # session is addressed by its routed name instead.
+        payload["dataset_ids"] = ids
+    else:
+        payload.update(fields)
+    if search_type:
+        payload["search_type"] = search_type
+    if context_profile:
+        payload["context_profile"] = context_profile
 
     def fetch_scopes():
         started = time.monotonic()
         result = _json_http_request("/api/v1/recall", payload, timeout=timeout)
         result = result if isinstance(result, list) else []
-        if dataset != target["write"] and "graph" in scope:
+        if dataset != write_dataset and "graph" in scope:
             remaining = timeout - (time.monotonic() - started)
             if remaining > 0.05:
                 primary_payload = {**payload, "datasets": [dataset], "scope": ["graph"]}
@@ -3609,14 +4787,20 @@ def improve_session_via_http(dataset: str, session_id: str, *, timeout: float = 
 
     dataset = route(dataset, session_id)["write"]
     submit_timeout = timeout if timeout is not None else _improve_submit_timeout()
+    improve_payload = {
+        **write_fields(dataset),
+        "session_ids": [session_id],
+        "run_in_background": True,
+    }
+    # Canonical UUID under shared memory: improve accepts dataset_id and
+    # prefers it over the name (which only resolves among owned datasets).
+    canonical_id = dataset_id_for(dataset)
+    if canonical_id:
+        improve_payload["dataset_id"] = canonical_id
     try:
         result = _json_http_request(
             "/api/v1/improve",
-            {
-                "dataset_name": dataset,
-                "session_ids": [session_id],
-                "run_in_background": True,
-            },
+            improve_payload,
             timeout=submit_timeout,
         )
     except urllib.error.HTTPError as exc:
@@ -3670,6 +4854,11 @@ def ensure_dataset_via_http(dataset: str) -> None:
     whole session's sync. Failures are logged and never block the improve —
     if the dataset truly cannot be created, the improve outcome reports it.
     """
+    if parse_dataset_id(dataset):
+        listing = list_writable_datasets()
+        if not any(row["id"] == dataset and row["writable"] is True for row in listing["datasets"]):
+            raise RuntimeError("Write permission for the selected dataset could not be verified")
+        return
     if not dataset:
         return
     try:

@@ -36,6 +36,10 @@ from event_names import event_fields
 # (_plugin_common.improve_throttle_reason), shared by every trigger.
 POLL_SECONDS = float(os.environ.get("COGNEE_IDLE_POLL", "10"))
 IDLE_SECONDS = float(os.environ.get("COGNEE_IDLE_THRESHOLD", "60"))
+# Shared agent memory: how often to re-resolve the active dataset's UUIDs and
+# backfill the shared role's grants, so a dataset another plugin created shows
+# up here within this interval rather than at the next session start.
+SHARED_REFRESH_SECONDS = float(os.environ.get("COGNEE_SHARED_MEMORY_REFRESH", "60"))
 
 _PLUGIN_DIR = Path.home() / ".cognee-plugin" / "codex"
 _ACTIVITY = _PLUGIN_DIR / "activity.ts"
@@ -295,6 +299,19 @@ async def _main_loop(session_id: str, dataset: str, config: dict) -> None:
     _check_llm_key(config)
     exit_reason = "loop_complete"
     bridge_disabled = False
+    # First shared-memory refresh one interval in: SessionStart just resolved
+    # everything, so an immediate re-resolve would only repeat its calls.
+    next_shared_refresh = time.time() + SHARED_REFRESH_SECONDS
+
+    def _refresh_shared_memory() -> None:
+        try:
+            from _plugin_common import refresh_shared_memory
+
+            if refresh_shared_memory():
+                _log("shared_memory_refreshed", session=session_id)
+        except Exception as exc:
+            _log("shared_memory_refresh_failed", error=str(exc)[:200])
+
     last_throttle_reason = ""
     known_pair = (session_id, dataset)
 
@@ -350,6 +367,9 @@ async def _main_loop(session_id: str, dataset: str, config: dict) -> None:
             break
 
         now = time.time()
+        if SHARED_REFRESH_SECONDS > 0 and now >= next_shared_refresh:
+            next_shared_refresh = now + SHARED_REFRESH_SECONDS
+            _refresh_shared_memory()
         ts = _read_activity_ts()
         if ts is None:
             await asyncio.sleep(POLL_SECONDS)

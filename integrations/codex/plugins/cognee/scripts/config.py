@@ -60,6 +60,20 @@ _DEFAULTS = {
     # Local mode
     "llm_api_key": "",
     "llm_model": "",
+    # Plugin identity: a dedicated agent sub-user + API key for this plugin
+    # (POST /api/v1/integrations/plugins/codex/provision) so cognee attributes
+    # its traffic per plugin. "auto" (default) provisions one only in service of
+    # shared agent memory (below) and falls back to the principal when that
+    # cannot be wired; "true" requires an identity and never falls back;
+    # "false" runs as the principal and ignores a cached identity.
+    "plugin_identity": "auto",
+    # Shared agent memory: every plugin agent of this user joins one shared role
+    # (``cognee-agent``) with read+write on the user's datasets, and the launch's
+    # dataset is addressed by its canonical UUID — so each plugin recalls what
+    # the others stored. Under identity mode ``auto`` this is what provisions an
+    # agent in the first place. Opt out with COGNEE_SHARED_AGENT_MEMORY=false
+    # for separated, per-plugin memory.
+    "shared_agent_memory": True,
 }
 
 
@@ -95,6 +109,8 @@ _ENV_MAP = {
     "COGNEE_SESSION_PREFIX": "session_prefix",
     "COGNEE_BASE_URL": "base_url",
     "COGNEE_API_KEY": "api_key",
+    "COGNEE_PLUGIN_IDENTITY": "plugin_identity",
+    "COGNEE_SHARED_AGENT_MEMORY": "shared_agent_memory",
     "COGNEE_USER_EMAIL": "user_email",
     "COGNEE_USER_PASSWORD": "user_password",
     "LLM_API_KEY": "llm_api_key",
@@ -298,6 +314,24 @@ async def ensure_dataset_ready_via_api(service_url: str, api_key: str, dataset: 
         return
 
     base = service_url.rstrip("/")
+    from _dataset_access import dataset_id
+
+    ident = dataset_id(dataset)
+    if ident:
+        from _plugin_common import require_typed_dataset_id_support
+
+        require_typed_dataset_id_support(service_url=service_url, api_key=api_key)
+        user_id = await _user_id_via_api(service_url, api_key)
+        if not user_id:
+            raise RuntimeError("Cannot authorize dataset ID without authenticated identity")
+        status, text = _cloud_http_request(
+            f"{base}/api/v1/permissions/principals/{user_id}/datasets?permission_name=write",
+            api_key=api_key,
+            timeout=15.0,
+        )
+        if status != 200 or not any(str(row.get("id")) == ident for row in json.loads(text)):
+            raise RuntimeError("403: no verified write permission on selected dataset")
+        return
     status, text = _cloud_http_request(
         f"{base}/api/v1/datasets/",  # trailing slash: cloud tenants 307-redirect the bare path
         method="POST",

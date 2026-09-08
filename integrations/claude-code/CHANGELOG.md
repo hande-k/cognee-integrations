@@ -10,6 +10,77 @@ Code only offers an update when that string changes. Tag releases as
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.0]
+
+### Added
+- **Plugin identity: the plugin can now run as its own cognee agent sub-user.**
+  Cognee servers that expose `POST /api/v1/integrations/plugins/claude-code/provision`
+  mint a dedicated agent identity (sub-user + labeled API key) per plugin, so the
+  dashboard attributes sessions, traces, and datasets to *this plugin* instead of
+  the shared principal key. The provisioned key is cached per service URL at
+  `~/.cognee-plugin/claude-code/agent_key.json` and outranks the env/cached
+  principal for data-plane traffic; datasets the agent creates are auto-shared
+  to the parent user.
+  - **Identity policy is `COGNEE_PLUGIN_IDENTITY` = `auto` (default) / `true` /
+    `false`.** `auto` provisions only in service of shared agent memory (below) and
+    reverts to the principal when that cannot be wired, so nothing the principal
+    owns is ever stranded; `true` is explicit and strict — provisioning is required
+    and never falls back to the owner; `false` runs as the principal and ignores a
+    cached identity.
+  - **Safe create-only provisioning, credentials bound to server and principal.**
+    Provisioning uses the SDK's `create_only` contract and never rotates an existing
+    key; a credential the server rejected is blocked and never reused, and one bound
+    to another principal is never used. Under `true` those stop with an error; under
+    `auto` the plugin runs as the principal and logs why. Local startup is serialized
+    with an OS lock; credential files are written atomically with owner-only
+    permissions. Servers without `create_only` (or the provision endpoint) leave
+    `auto` installs on the principal.
+  - `cognee-doctor` reports the new key source as **Plugin identity**.
+- **Shared agent memory (default): one memory across all of your plugin
+  agents.** A plugin identity is its own user, and cognee's grants flow
+  child→parent only — left alone, per-plugin identities would silo memory
+  (Claude Code could not recall what Codex stored). Session start now wires
+  the agent into a shared `cognee-agent` role in your tenant (created for a
+  tenant-less fresh install) with read+write on your datasets, backfilled on
+  every launch and every ~60s by the idle watcher so a dataset another plugin
+  creates shows up without a restart. The launch's dataset becomes a
+  canonical, user-owned dataset addressed by UUID (`dataset_id`/`dataset_ids`
+  on the launch record) — a name only resolves among datasets the caller owns,
+  which would fork an empty per-agent copy — and recall, remember, the
+  session-entry store, improve and the skills all address it that way;
+  pre-existing same-named copies stay in the recall set.
+  - **Opt out** with `"shared_agent_memory": false` in config.json or
+    `COGNEE_SHARED_AGENT_MEMORY=false` for separated, per-plugin memory (the
+    previous behaviour, name-addressed). The agent is removed from the
+    shared role — it can no longer read or write your datasets — keeps its
+    identity, and starts writing to its own, private dataset; what it shared
+    before stays in your user's dataset (still yours, still visible in the
+    dashboard). Re-enabling puts it back into the same role and dataset.
+  - Degrades to separated memory — never fails a session — when the server
+    has no permissions API or cannot store session entries by dataset UUID,
+    when you are not the owner of your tenant, or when a tenant-less user
+    already owns datasets (activating a tenant would hide them). Under
+    `auto` an install that hits one of those stays on the principal.
+  - Every tenant/role/grant call runs as the *principal*: an agent key can
+    never widen its own access (server-enforced, owner-only).
+  - `cognee-doctor` shows **Memory Sharing** (`shared (role: cognee-agent)` /
+    `separated (<reason>)` / `principal (...)`).
+- **Dataset UUIDs throughout registration, remember, improve, recall, and
+  switching.** A UUID-shaped dataset is addressed as an id; effective write
+  permissions (not ownership alone) determine the datasets you can switch to,
+  and a failed switch persistence keeps the previous session and unregisters
+  the unused new connection.
+- **Explicit graph read datasets** through `COGNEE_PLUGIN_READ_DATASET_IDS`
+  (a JSON array of UUIDs): federated graph recall separate from the session's
+  single write dataset; it takes precedence over the datasets shared memory
+  resolved.
+
+### Changed
+- Native plugin connection types replace the generic API type.
+- Identity provisioning requires `COGNEE_PLUGIN_IDENTITY=true` in `~/.cognee/.env`.
+  `false` explicitly disables cached identities; there is no config.json setting.
+- Safe identity provisioning requires an SDK exposing the `create_only` parameter.
+
 ## [1.4.4]
 
 ### Fixed

@@ -25,6 +25,7 @@ _REPORT_KEYS = {
     "env_file",
     "server_url",
     "api_key_source",
+    "memory_sharing",
     "reachable",
     "latency_ms",
     "cognee_local",

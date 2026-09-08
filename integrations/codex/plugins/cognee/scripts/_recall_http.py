@@ -165,6 +165,15 @@ def coerce_code_query(value):
     return parsed if isinstance(parsed, dict) else None
 
 
+def coerce_dataset_ids(value):
+    """Normalise ``dataset_ids`` from argv (comma-separated) or a list to a clean list."""
+    if not value:
+        return []
+    if isinstance(value, str):
+        value = value.split(",")
+    return [str(x).strip() for x in value if str(x).strip()]
+
+
 def do_recall(
     service_url,
     api_key,
@@ -175,11 +184,18 @@ def do_recall(
     dataset="",
     context_profile="",
     code_query=None,
+    dataset_ids="",
     *,
     opener=None,
     timeout=120.0,
 ):
-    """Query the server. Return results (list), an error envelope (dict), or ``UNREACHABLE``."""
+    """Query the server. Return results (list), an error envelope (dict), or ``UNREACHABLE``.
+
+    ``dataset_ids`` (a list, or a comma-separated string from argv) addresses
+    the search by UUID and takes precedence over ``dataset`` — under shared
+    agent memory the launch's dataset is a canonical parent-owned one the
+    agent can only reach by id, since a name resolves among owned datasets.
+    """
     url = service_url.rstrip("/") + "/api/v1/recall"
     body = {
         "query": query,
@@ -202,8 +218,25 @@ def do_recall(
     # authenticated user or the server returns DatasetNotFoundError.
     # When dataset is empty (standalone invocation without shell), fall back to
     # the original search-all behaviour to avoid breaking direct callers.
-    if dataset:
-        body["datasets"] = [dataset]
+    from _dataset_access import recall_fields
+
+    # Precedence: COGNEE_PLUGIN_READ_DATASET_IDS on a graph-only recall (the
+    # user's own federated read set; session history stays bound to ONE
+    # dataset, so the session id is dropped), then the UUIDs shared memory
+    # resolved for the launch, then the dataset itself (id when UUID-shaped).
+    fields, federated = recall_fields(dataset, body["scope"])
+    ids = coerce_dataset_ids(dataset_ids)
+    if ids and body["scope"] != ["graph"]:
+        # Session history is bound to ONE dataset — the canonical write dataset,
+        # first in the resolved list; same-named copies only widen graph recall.
+        ids = ids[:1]
+    if federated:
+        body.update(fields)
+        body.pop("session_id", None)
+    elif ids:
+        body["dataset_ids"] = ids
+    else:
+        body.update(fields)
     if context_profile:
         body["context_profile"] = context_profile
     headers = {"Content-Type": "application/json"}
@@ -265,11 +298,12 @@ def do_recall(
 
 def main(argv):
     # argv: service_url, api_key, query, session_id, scope, top_k[, dataset
-    #        [, context_profile[, code_query]]]
+    #        [, context_profile[, code_query[, dataset_ids]]]]
     # code_query (arg 9): JSON dict for the deterministic "code" scope, e.g.
     # '{"operation": "impact_analysis", "targets": ["process_payment"]}'.
-    a = list(argv) + [""] * 9
-    result = do_recall(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8])
+    # dataset_ids (arg 10): comma-separated UUIDs; wins over the dataset name.
+    a = list(argv) + [""] * 10
+    result = do_recall(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9])
     # UNREACHABLE → caller falls back to CLI; a list (results) or an error
     # object → caller prints as-is and does NOT fall back.
     print(UNREACHABLE if result == UNREACHABLE else json.dumps(result))
