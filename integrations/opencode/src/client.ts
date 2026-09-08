@@ -158,6 +158,8 @@ export class CogneeHttpClient {
           continue;
         }
         throw error;
+      } finally {
+        clearTimeout(timer);
       }
     }
     throw lastError;
@@ -214,6 +216,24 @@ export class CogneeHttpClient {
       datasetName: response.dataset_name ?? params.datasetName,
       status: response.status,
     };
+  }
+
+  async searchSources(params: {
+    query: string; sourceHint?: string; datasetIds?: string[];
+    includeConnections?: boolean; topK?: number;
+  }): Promise<Record<string, unknown>> {
+    // SDK route only: older/cloud endpoints must fail explicitly, never fall
+    // back to a broader graph or a different principal.
+    return this.fetchAPI<Record<string, unknown>>("/api/v1/datasets/source-search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query: params.query, source_hint: params.sourceHint,
+        dataset_ids: params.datasetIds, top_k: params.topK ?? 10,
+        include_connections: params.includeConnections ?? true,
+      }),
+      redirect: "error",
+    }, 300_000, async (response) => await response.json() as Record<string, unknown>, 0);
   }
 
   async recall(params: {

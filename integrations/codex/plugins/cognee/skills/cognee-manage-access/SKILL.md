@@ -19,8 +19,9 @@ PR #4942; Cognee 1.5.4 supports the existing-principal access commands.
   user requested; do not infer team-wide sharing from a request to recall memory.
 - Select graph reads with `read --session-key HOST_ID --dataset-id UUID ...`.
   No dataset arguments restores recall of the active write dataset. This changes
-  recall selection, not permissions. The selection is bound to the current
-  identity, backend, and host launch; account changes require re-selection.
+  recall selection, not permissions. Add `--persist` (session key optional) to save a default for future launches.
+  Launch-specific selections take precedence over that default. Both are bound
+  to the identity and backend; account/key changes require re-selection.
 - Switch writes with `write UUID --session-key HOST_ID`. It syncs first, then
   registers a fresh session and changes the launch record. A failed sync aborts.
   Never bypass that failure automatically. Reads and writes are independent.

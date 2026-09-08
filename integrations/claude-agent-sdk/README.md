@@ -400,3 +400,24 @@ MIT License
 
 Contributions are welcome! Please feel free fork to submit a PR.
 
+
+
+### Connected source search
+
+Use `search_sources` for questions spanning connected sources. Provide a question and an
+optional source name/description; there is no provider list in the plugin. The SDK
+routes authorized dataset/node-set descriptors and native database connections,
+then executes document retrieval or read-only SQL as appropriate. SQL evidence
+includes the query and bounded rows; these rows are not ingested into memory.
+
+This explicit operation is separate from automatic session/project recall. Optional
+`dataset_ids` restricts the search to those datasets and excludes live connections;
+`include_connections=false` disables live database queries. Without dataset selection,
+it discovers the caller's readable catalog. Native connection permissions and
+`TOOL_CALLS_ENABLED` still apply. A dataset grant does not grant database access.
+
+Requires the SDK source-search API (SDK draft #4978). Unsupported servers and denied
+requests fail explicitly. Inspect routing, evidence and partial errors before treating
+a question as answered; unselected sources have not been searched.
+
+Bind trusted read scope or embedded identity with `cognee_tools(source_search_kwargs={...})`. Served mode uses the API key from `cognee.serve()`; omit a local `user`. Pass an empty `source_hint` for a general question.

@@ -557,6 +557,21 @@ class HttpBackend(MemoryBackend):
 
     # -- operations --------------------------------------------------------
 
+    def search_sources(
+        self, *, query, source=None, dataset_ids=None, include_connections=True, timeout=300
+    ):
+        return self._request(
+            "POST",
+            "/api/v1/datasets/source-search",
+            timeout=timeout,
+            json_body={
+                "query": query,
+                "source_hint": source,
+                "dataset_ids": dataset_ids,
+                "include_connections": include_connections,
+            },
+        )
+
     def recall(
         self,
         *,

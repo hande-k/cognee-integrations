@@ -57,6 +57,14 @@ export class HttpCogneeClient implements CogneeClient {
     }
   }
 
+  async searchSources(query: string, options: { sourceHint?: string; datasetIds?: string[]; includeConnections?: boolean; signal?: AbortSignal } = {}): Promise<unknown> {
+    const response = await this.send("POST", "/api/v1/datasets/source-search", {json: {
+      query, source_hint: options.sourceHint, dataset_ids: options.datasetIds,
+      include_connections: options.includeConnections ?? true,
+    }}, options.signal, 300_000);
+    return this.parse(response, "source search");
+  }
+
   async recall(query: string, options: RecallOptions = {}): Promise<RecallResponseItem[]> {
     const body: Record<string, unknown> = { query };
 
@@ -167,9 +175,10 @@ export class HttpCogneeClient implements CogneeClient {
     path: string,
     payload?: { json?: unknown; form?: FormData },
     externalSignal?: AbortSignal,
+    timeoutMs = this.timeoutMs,
   ): Promise<Response> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     if (externalSignal) {
       if (externalSignal.aborted) {
         controller.abort();
@@ -179,6 +188,7 @@ export class HttpCogneeClient implements CogneeClient {
     }
 
     const init: RequestInit = { method, signal: controller.signal };
+    if (path === "/api/v1/datasets/source-search") init.redirect = "error";
     if (payload?.json !== undefined) {
       init.body = JSON.stringify(payload.json);
       init.headers = this.buildHeaders({ "Content-Type": "application/json" });

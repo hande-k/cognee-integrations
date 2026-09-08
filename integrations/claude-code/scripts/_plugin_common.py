@@ -3512,11 +3512,19 @@ def graph_read_scope_path(host_key: str) -> Path:
     return _PLUGIN_DIR / "read-scopes" / f"{digest}.json"
 
 
+def persistent_graph_read_scope_path() -> Path:
+    # Plugin-specific directory + backend + credential: never reuse another
+    # account's selection, even when the same machine/server is used.
+    identity = _normalize_service_url(_local_api_url()) + "\n" + _principal_fingerprint(_api_key())
+    digest = hashlib.sha256(identity.encode()).hexdigest()
+    return _PLUGIN_DIR / "read-scopes" / f"default-{digest}.json"
+
+
 def load_graph_read_scope():
     host_key = get_session_key()
-    if not host_key:
-        return None
-    path = graph_read_scope_path(host_key)
+    path = graph_read_scope_path(host_key) if host_key else None
+    if path is None or not path.exists():
+        path = persistent_graph_read_scope_path()
     if not path.exists():
         return None
     record = _load_json_file(path)
@@ -3524,7 +3532,10 @@ def load_graph_read_scope():
         "credential_fingerprint"
     ) != _principal_fingerprint(_api_key()):
         raise RuntimeError("Read scope belongs to a different identity or server; select it again")
-    return record.get("dataset_ids", [])
+    ids = record.get("dataset_ids")
+    if not isinstance(ids, list) or not all(parse_dataset_id(value) for value in ids):
+        raise RuntimeError("Invalid saved graph read selection; select it again")
+    return ids
 
 
 def recall_via_http(

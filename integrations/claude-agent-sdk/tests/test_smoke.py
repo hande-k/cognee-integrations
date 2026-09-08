@@ -1,3 +1,8 @@
+import asyncio
+
+import pytest
+
+
 def test_imports():
     from cognee_integration_claude import (
         cognee_tools,
@@ -16,10 +21,10 @@ def test_cognee_tools_returns_remember_and_recall():
     from cognee_integration_claude import cognee_tools
 
     tools = cognee_tools()
-    assert len(tools) == 2
+    assert len(tools) == 3
 
     sessioned = cognee_tools("test-session")
-    assert len(sessioned) == 2
+    assert len(sessioned) == 3
 
 
 def test_render_results_handles_each_source():
@@ -36,3 +41,28 @@ def test_render_results_handles_each_source():
     assert render_results(results) == ["graph hit", "ans", "ctx", "trace blob"]
     assert render_results(None) == []
     assert render_results([]) == []
+
+
+@pytest.mark.parametrize("inherited", [True, False])
+def test_source_tool_uses_sdk_routing_and_bound_identity(monkeypatch, inherited):
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    import cognee
+    from cognee_integration_claude import cognee_tools
+
+    method = AsyncMock(return_value={"evidence": [{"retrieval_method": "sql"}]})
+    monkeypatch.setattr(cognee, "sources", SimpleNamespace(search=method), raising=False)
+    user = object()
+    tools = cognee_tools(
+        "session",
+        **(
+            {"recall_kwargs": {"user": user}}
+            if inherited
+            else {"source_search_kwargs": {"user": user}}
+        ),
+    )
+    result = asyncio.run(tools[2].handler({"query": "counts", "source_hint": "arbitrary source"}))
+    assert json.loads(result["content"][0]["text"])["evidence"][0]["retrieval_method"] == "sql"
+    method.assert_awaited_once_with("counts", source_hint="arbitrary source", user=user)

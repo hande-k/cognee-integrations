@@ -342,7 +342,7 @@ class TestDispatch(unittest.TestCase):
                 self.assertIn("temporarily unavailable", out["error"])
         self.assertEqual(fake.calls, [])
 
-    def test_tool_schemas_are_the_five_declared_tools_with_required_params(self):
+    def test_tool_schemas_are_the_declared_tools_with_required_params(self):
         provider = make_provider()
         schemas = {schema["name"]: schema for schema in provider.get_tool_schemas()}
         self.assertEqual(
@@ -353,6 +353,7 @@ class TestDispatch(unittest.TestCase):
                 "cognee_forget",
                 "cognee_switch_dataset",
                 "cognee_code_search",
+                "cognee_search_sources",
             },
         )
         self.assertEqual(schemas["cognee_recall"]["parameters"]["required"], ["query"])
@@ -368,7 +369,9 @@ class TestDispatch(unittest.TestCase):
     def test_optional_tools_can_be_disabled_by_config(self):
         provider = make_provider(config={"dataset_switch_tool": False, "code_search_tool": False})
         names = {schema["name"] for schema in provider.get_tool_schemas()}
-        self.assertEqual(names, {"cognee_recall", "cognee_remember", "cognee_forget"})
+        self.assertEqual(
+            names, {"cognee_recall", "cognee_remember", "cognee_forget", "cognee_search_sources"}
+        )
 
 
 # --------------------------------------------------------------------------
@@ -597,3 +600,28 @@ class TestForgetPayload(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def test_source_search_preserves_structured_sql_evidence():
+    from unittest.mock import Mock
+
+    provider = make_provider()
+    result = {
+        "evidence": [
+            {"retrieval_method": "sql", "structured": {"sql": "SELECT 1", "rows": [{"n": 1}]}}
+        ],
+        "coverage": {"complete": False},
+    }
+    provider._backend = Mock()
+    provider._backend.search_sources.return_value = result
+    assert (
+        _call(provider, "cognee_search_sources", {"query": "count", "source": "a new database"})
+        == result
+    )
+    provider._backend.search_sources.assert_called_once_with(
+        query="count",
+        source="a new database",
+        dataset_ids=None,
+        include_connections=True,
+        timeout=300,
+    )

@@ -70,14 +70,14 @@ describe("tool registration", () => {
   it("registers a factory under all contract names", () => {
     const { registerTool, tools } = createPluginApi(plugin);
     expect(registerTool).toHaveBeenCalledTimes(1);
-    expect(registerTool.mock.calls[0][1]).toEqual({ names: ["memory_search", "memory_get", "memory_forget", "memory_switch_dataset", "memory_code_search"] });
-    expect(tools({ agentId: "will" }).map((t) => t.name)).toEqual(["memory_search", "memory_get", "memory_forget", "memory_switch_dataset", "memory_code_search"]);
+    expect(registerTool.mock.calls[0][1]).toEqual({ names: ["memory_search", "memory_get", "memory_forget", "memory_switch_dataset", "memory_code_search", "cognee_search_sources"] });
+    expect(tools({ agentId: "will" }).map((t) => t.name)).toEqual(["memory_search", "memory_get", "memory_forget", "memory_switch_dataset", "memory_code_search", "cognee_search_sources"]);
   });
 
   it("leaves optional tools out when their flags are false", () => {
     const { registerTool, tools } = createPluginApi(plugin, { memoryForgetTool: false, datasetSwitchTool: false, codeSearchTool: false });
-    expect(registerTool.mock.calls[0][1]).toEqual({ names: ["memory_search", "memory_get"] });
-    expect(tools({ agentId: "will" }).map((t) => t.name)).toEqual(["memory_search", "memory_get"]);
+    expect(registerTool.mock.calls[0][1]).toEqual({ names: ["memory_search", "memory_get", "cognee_search_sources"] });
+    expect(tools({ agentId: "will" }).map((t) => t.name)).toEqual(["memory_search", "memory_get", "cognee_search_sources"]);
   });
 
   it("registers nothing when memoryTools is false", () => {

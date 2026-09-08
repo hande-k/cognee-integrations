@@ -205,3 +205,34 @@ CODE_SEARCH_SCHEMA = {
         "required": ["operation"],
     },
 }
+
+
+SOURCE_SEARCH_SCHEMA = {
+    "name": "cognee_search_sources",
+    "description": (
+        "Search authorized connected sources. Cognee discovers dataset/node-set "
+        "metadata and database tools, then selects native document or read-only "
+        "SQL retrieval. Use for source questions; cognee_recall retains "
+        "session/project recall."
+    ),
+    "parameters": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+            "query": {"type": "string", "minLength": 1},
+            "source": {
+                "type": "string",
+                "description": "Optional source hint resolved from metadata",
+            },
+            "dataset_ids": {
+                "type": "array",
+                "items": {"type": "string", "format": "uuid"},
+                "description": "Optional dataset restriction; excludes database connections",
+            },
+            "include_connections": {
+                "type": "boolean",
+                "description": "Allow authorized read-only database queries (default true)",
+            },
+        },
+    },
+}

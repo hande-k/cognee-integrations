@@ -25,50 +25,7 @@ set -euo pipefail
 
 PLUGIN_DIR="${HOME}/.cognee-plugin/claude-code"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" >/dev/null 2>&1 && pwd)"
-runtime_json="$(python3 - <<'PY' "${PLUGIN_DIR}" "${SELF_DIR}" 2>/dev/null || true
-import json
-import pathlib
-import sys
-
-plugin_dir = pathlib.Path(sys.argv[1])
-import os
-# One-time config from ~/.cognee/.env (shell exports still win).
-sys.path.insert(0, sys.argv[2])
-try:
-    from _env_file import load_env_file
-    load_env_file()
-except Exception:
-    pass
-service_url = (os.environ.get("COGNEE_BASE_URL") or os.environ.get("COGNEE_LOCAL_API_URL") or "http://localhost:8011").strip()
-api_key = (os.environ.get("COGNEE_API_KEY") or "").strip()
-
-if not api_key:
-    cache_path = plugin_dir.parent / "api_key.json"
-    if cache_path.exists():
-        try:
-            cache = json.loads(cache_path.read_text())
-            if isinstance(cache, dict):
-                key = str(cache.get("api_key") or "").strip()
-                cached_url = str(cache.get("base_url") or "").strip().rstrip("/")
-                if key and (not cached_url or cached_url == service_url.rstrip("/")):
-                    api_key = key
-        except Exception:
-            pass
-
-dataset = (os.environ.get("COGNEE_PLUGIN_DATASET") or "").strip()
-# The launch record wins: it carries the dataset chosen with switch-dataset.py.
-try:
-    from _plugin_common import _read_map_record, resolve_host_key_outside_hook
-    _host_key, _ = resolve_host_key_outside_hook()
-    _rec = _read_map_record(_host_key) if _host_key else {}
-    if str(_rec.get("dataset") or "").strip():
-        dataset = str(_rec["dataset"]).strip()
-except Exception:
-    pass
-
-print(json.dumps({"service_url": service_url, "api_key": api_key, "dataset": dataset}))
-PY
-)"
+runtime_json="$(python3 "${SELF_DIR}/_command_runtime.py")"
 
 SERVICE_URL="$(python3 - <<'PY' "${runtime_json}" 2>/dev/null || true
 import json, sys

@@ -86,6 +86,11 @@ class MemoryBackend:
 
     # -- operations --------------------------------------------------------
 
+    def search_sources(
+        self, *, query, source=None, dataset_ids=None, include_connections=True, timeout=300
+    ):
+        raise NotImplementedError("Source search is unavailable on this backend")
+
     def recall(
         self,
         *,
@@ -314,6 +319,23 @@ class SdkBackend(MemoryBackend):
         self._bridge.shutdown()
 
     # -- operations --------------------------------------------------------
+
+    def search_sources(
+        self, *, query, source=None, dataset_ids=None, include_connections=True, timeout=300
+    ):
+        import cognee
+
+        kwargs = {
+            "query": query,
+            "source_hint": source,
+            "dataset_ids": dataset_ids,
+            "include_connections": include_connections,
+        }
+        if not self.served:
+            if self._user is None:
+                raise ValueError("Embedded source search requires the configured identity")
+            kwargs["user"] = self._user
+        return self._bridge.run(cognee.sources.search(**kwargs), timeout=timeout)
 
     def recall(
         self,
