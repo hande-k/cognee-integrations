@@ -14,6 +14,8 @@ export interface CogneeClient {
   /** Query project memory. Maps to `POST /api/v1/recall`. */
   recall(query: string, options?: RecallOptions): Promise<RecallResponseItem[]>;
 
+  searchSources?(query: string, options?: { sourceHint?: string; datasetIds?: string[]; includeConnections?: boolean; signal?: AbortSignal }): Promise<unknown>;
+
   /** Ingest text and build the graph in one call. Maps to `POST /api/v1/remember`. */
   remember(data: string, options: RememberOptions): Promise<RememberResult>;
 

@@ -33,6 +33,7 @@
   "activationEvents": [],
   "contributes": {
     "commands": [
+      {"command": "cognee.searchSources", "title": "Search Connected Sources", "category": "Cognee"},
       {
         "command": "cognee.askProjectMemory",
         "title": "Ask My Project Memory",

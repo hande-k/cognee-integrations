@@ -92,3 +92,15 @@ async def test_sessionized_tools_bind_the_session():
     search_mock.assert_awaited_once_with(
         "q", query_type=cognee.SearchType.CHUNKS, datasets=[ds], node_name=[ds]
     )
+
+
+@pytest.mark.asyncio
+async def test_source_search_delegates_to_served_sdk_without_project_mutation(monkeypatch):
+    from types import SimpleNamespace
+
+    from cognee_integration_aider import search_sources
+    method = AsyncMock(return_value={"evidence": [{"retrieval_method": "sql"}]})
+    monkeypatch.setattr(cognee, "sources", SimpleNamespace(search=method), raising=False)
+    result = await search_sources("counts", source_hint="anything", include_connections=False)
+    assert result["evidence"][0]["retrieval_method"] == "sql"
+    method.assert_awaited_once_with("counts", source_hint="anything", include_connections=False)

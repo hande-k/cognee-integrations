@@ -25,7 +25,7 @@ import {
 } from "./persistence.js";
 import { RecallBreaker, isBreakerError } from "./breaker.js";
 import { compileNoisePatterns, isHarnessNoise } from "./noise.js";
-import { ReferenceCache, SESSION_LAYER_SCOPES, createMemoryTools } from "./tools.js";
+import { ReferenceCache, SESSION_LAYER_SCOPES, createMemoryTools, createSourceSearchTool } from "./tools.js";
 import { createMemoryForgetTool } from "./forget-tool.js";
 import { DatasetSwitchStore, createDatasetSwitchTool, withSessionSuffix } from "./dataset-switch.js";
 import { PLUGIN_VERSION, formatUpdateHint, isNewer, readUpdateCache, runUpdateCheck } from "./version.js";
@@ -358,6 +358,7 @@ const memoryCogneePlugin = {
         ...(cfg.memoryForgetTool ? ["memory_forget"] : []),
         ...(cfg.datasetSwitchTool ? ["memory_switch_dataset"] : []),
         ...(cfg.codeSearchTool ? ["memory_code_search"] : []),
+        "cognee_search_sources",
       ];
       const toolLogger = { debug: (m: string) => api.logger.debug?.(m), warn: (m: string) => api.logger.warn?.(m) };
 
@@ -458,6 +459,7 @@ const memoryCogneePlugin = {
               );
             }
             if (codeSearchTool) tools.push(codeSearchTool);
+            tools.push(createSourceSearchTool(client));
             return tools;
           }) as unknown as Parameters<OpenClawPluginApi["registerTool"]>[0],
           { names: toolNames },

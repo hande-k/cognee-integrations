@@ -495,3 +495,30 @@ export function createMemoryTools(deps: MemoryToolsDeps, ctx: MemoryToolContext)
   const shared: MemoryToolsDeps = { ...deps, cache: deps.cache ?? new ReferenceCache() };
   return [createMemorySearchTool(shared, ctx), createMemoryGetTool(shared, ctx)];
 }
+
+/** Explicit source retrieval; kept off the prompt-time session recall path. */
+export function createSourceSearchTool(client: Pick<CogneeHttpClient, "searchSources">) {
+  return {
+    name: "cognee_search_sources",
+    label: "Search Connected Sources",
+    description: "Search authorized connected sources. Cognee discovers datasets, node sets and database tools from metadata and selects document or read-only SQL retrieval. Use for source questions; memory_search retains session/project recall.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", minLength: 1 },
+        source: { type: "string", description: "Optional source hint resolved from metadata" },
+        dataset_ids: { type: "array", items: { type: "string", format: "uuid" }, description: "Optional dataset restriction; excludes database connections" },
+        include_connections: { type: "boolean", description: "Allow authorized read-only database queries (default true)" },
+      },
+      required: ["query"],
+    },
+    async execute(_id: string, params: {query: string; source?: string; dataset_ids?: string[]; include_connections?: boolean}) {
+      try {
+        return jsonResult(await client.searchSources({query: params.query, sourceHint: params.source,
+          datasetIds: params.dataset_ids, includeConnections: params.include_connections}));
+      } catch {
+        return jsonResult({error: "Source search unavailable; check server capability and caller permissions.", complete: false});
+      }
+    },
+  };
+}

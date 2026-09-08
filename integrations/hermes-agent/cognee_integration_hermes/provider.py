@@ -34,6 +34,7 @@ from .schemas import (
     FORGET_SCHEMA,
     RECALL_SCHEMA,
     REMEMBER_SCHEMA,
+    SOURCE_SEARCH_SCHEMA,
     SWITCH_DATASET_SCHEMA,
 )
 from .server_bootstrap import ensure_local_server
@@ -488,7 +489,9 @@ class CogneeMemoryProvider(MemoryProvider):
             "Use cognee_recall for prior context, cognee_remember for durable facts, "
             "cognee_forget when the user asks to remove Cognee memory, "
             "cognee_switch_dataset to move this conversation to another dataset, and "
-            "cognee_code_search for structural questions about an indexed repository.",
+            "cognee_code_search for structural questions about an indexed repository. "
+            "Use cognee_search_sources for connected-source questions; the SDK "
+            "selects document or read-only SQL retrieval.",
         ]
         # The memory steer — the counterpart of claude-code's COGNEE_PREFER_MEMORY
         # and openclaw's memorySteer: without it the agent reaches for the host's
@@ -593,7 +596,7 @@ class CogneeMemoryProvider(MemoryProvider):
         self._sync_thread.start()
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        schemas = [RECALL_SCHEMA, REMEMBER_SCHEMA, FORGET_SCHEMA]
+        schemas = [RECALL_SCHEMA, REMEMBER_SCHEMA, FORGET_SCHEMA, SOURCE_SEARCH_SCHEMA]
         # Config may not be loaded yet when Hermes collects schemas; the
         # defaults (on) match load_config's, so both paths agree.
         if str_to_bool(self._config.get("dataset_switch_tool"), True):
@@ -614,6 +617,26 @@ class CogneeMemoryProvider(MemoryProvider):
                     )
                 }
             )
+        if tool_name == "cognee_search_sources":
+            try:
+                result = self._backend.search_sources(
+                    query=args["query"],
+                    source=args.get("source"),
+                    dataset_ids=args.get("dataset_ids"),
+                    include_connections=args.get("include_connections", True),
+                    timeout=300,
+                )
+                return json.dumps(result, default=str)
+            except Exception:
+                return json.dumps(
+                    {
+                        "error": (
+                            "Source search unavailable; check server capability and caller "
+                            "permissions."
+                        ),
+                        "complete": False,
+                    }
+                )
         if tool_name == "cognee_recall":
             return self._handle_recall(args)
         if tool_name == "cognee_remember":

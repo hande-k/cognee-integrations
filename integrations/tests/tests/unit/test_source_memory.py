@@ -27,19 +27,24 @@ def test_source_hint_is_arbitrary_metadata_not_a_provider_enum(memory):
     assert calls[-1][1]["dataset_ids"] is None
 
 
-def test_inconclusive_routing_is_not_an_empty_content_search(memory):
+def test_source_search_delegates_native_capabilities_without_graph_fallback(memory):
     args = memory.parser().parse_args(["search", "a vague question", "--all-readable"])
     calls = []
+    expected = {
+        "routing": {"status": "inconclusive"},
+        "evidence": [],
+        "coverage": {"complete": False},
+    }
 
     class Client:
         def request(self, path, payload=None):
-            calls.append(path)
-            return {"targets": [], "status": "inconclusive"}
+            calls.append((path, payload))
+            return expected
 
-    result = memory.search(Client(), args, {"dataset": "sessions"})
-    assert calls == ["/api/v1/datasets/source-route"]
-    assert "not a no-results answer" in result["next_step"]
-    assert result["coverage"]["complete"] is False
+    assert memory.search(Client(), args, {"dataset": "sessions"}) == expected
+    assert calls[0][0] == "/api/v1/datasets/source-search"
+    assert calls[0][1]["include_connections"] is True
+    assert len(calls) == 1
 
 
 def test_explicit_selection_wins_over_saved_scope(memory, monkeypatch):

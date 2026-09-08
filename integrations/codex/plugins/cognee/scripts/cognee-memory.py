@@ -51,7 +51,7 @@ class Client:
             data=json.dumps(payload).encode() if payload is not None else None,
             headers=headers,
         )
-        timeout = 180 if path == "/api/v1/datasets/source-route" else 45
+        timeout = 300 if path.endswith(("/source-route", "/source-search")) else 45
         with self.opener.open(req, timeout=timeout) as response:
             body = response.read(MAX_RESPONSE + 1)
         if len(body) > MAX_RESPONSE:
@@ -161,17 +161,21 @@ def search(client, args, runtime):
         ]
         routing = {"targets": targets, "status": "explicit", "complete": True}
     else:
-        routing = route(client, args, runtime)
-        targets = routing.get("targets", [])
-        if not targets:
-            return {
-                "mode": "search",
-                "routing": routing,
-                "evidence": [],
-                "coverage": {"complete": False, "searched_targets": []},
-                "next_step": "Inspect sources, narrow the question, or raise the catalog budget. "
-                "No content search was performed; this is not a no-results answer.",
-            }
+        # The SDK owns capability selection and execution. In particular,
+        # relational sources use authorized native SQL, not document chunks.
+        return client.request(
+            "/api/v1/datasets/source-search",
+            {
+                "query": args.query,
+                "source_hint": args.source,
+                "dataset_ids": readable_selection(client, args, runtime),
+                "max_sources": args.max_sources,
+                "max_catalog_entries": args.catalog_budget,
+                "exclude_source_ids": args.exclude_source_id,
+                "include_connections": not args.documents_only,
+                "top_k": args.top_k,
+            },
+        )
     evidence, seen, rejected, metadata_cache = [], set(), 0, {}
     for target in targets:
         nodes = target["node_sets"]
@@ -261,6 +265,9 @@ def parser():
             p.add_argument("--catalog-budget", type=int, default=512)
         if command == "search":
             p.add_argument("top_k", nargs="?", type=int, default=10)
+            p.add_argument(
+                "--documents-only", action="store_true", help="Exclude live database tools"
+            )
             mode = p.add_mutually_exclusive_group()
             for flag in ("session", "graph", "code"):
                 mode.add_argument("--" + flag, action="store_true")

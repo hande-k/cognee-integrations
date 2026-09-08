@@ -77,7 +77,8 @@ The catalog contains permission-filtered datasets and node sets with stable IDs,
 names, source aliases, short descriptions, sample document labels and available
 operations. It is derived from current Cognee metadata; there is no provider list
 in the plugin. A new connector's imported node sets are discoverable without a
-plugin update. Empty connections with no imported data are not catalog entries.
+plugin update. Authorized native SQL connections are also discoverable when tool calls
+are enabled, even without ingested documents. Other empty connectors are not entries.
 
 Session capture keeps one write dataset. To select several readable graph datasets:
 
@@ -102,8 +103,9 @@ python3 "${CODEX_PLUGIN_ROOT}/scripts/cognee-memory.py" route "deployment decisi
 ```
 
 `--source` accepts natural language, not an enum. Cognee's configured LLM selects
-likely targets from authorized metadata, then the plugin retrieves native CHUNKS
-from those targets. Routing does not read source bodies or contact connectors.
+likely targets from authorized metadata, then the SDK uses their declared retrieval
+capabilities: native CHUNKS for documents or read-only SQL for database tools.
+Routing itself does not read source bodies or open external databases.
 The server validates model-selected IDs; model output cannot invent permissions
 or arbitrary tool calls. `route` previews targets and reasons without content search.
 
@@ -154,14 +156,14 @@ or a synchronization time. No provider-specific date-window parser is provided.
 Report evidence links, the actual searched targets, and coverage limitations.
 Ranked chunks are not an exhaustive export. Imported records do not establish
 that a source is fully synchronized. Unknown synchronization time stays unknown.
-These commands search stored memory: an imported database schema is searchable,
-but fetching live rows requires the existing authorized Cognee tool connection.
+Source search can use stored memory and the existing authorized Cognee tool
+connections. An imported database schema is metadata, not live business rows.
 Do not silently ingest rows or fetch from a connector to fill missing evidence.
 
 ## Compatibility and failures
 
 Source discovery requires the SDK's `/api/v1/datasets/source-catalog`,
-`source-route`, `source-documents` and `source-document` routes, plus HTTP node-set
+`source-route`, `source-search`, `source-documents` and `source-document` routes, plus HTTP node-set
 operator forwarding. Missing routes are reported as a server capability error.
 Each response is limited to 16 MiB and each command to 64 MiB. Budget errors are
 failures, not successful complete results.
@@ -223,3 +225,20 @@ uv run cognee-cli forget --dataset <dataset-name>
 
 Avoid `uv run cognee-cli forget --everything` unless the user explicitly asks
 to delete all Cognee data.
+
+
+### Connected sources and database questions
+
+For an explicit question about connected sources, use `cognee-memory.py search "question"`
+with an optional `--source "name or description"`. The server discovers authorized
+sources from metadata and chooses retrieval from their capabilities. A live database
+uses Cognee's native read-only SQL tool; do not substitute CHUNKS or assume a schema
+catalog contains business rows. SQL evidence includes the connection, generated SQL,
+rows, truncation status and query time. Document evidence carries document/dataset IDs.
+
+Use `--documents-only` to exclude database execution. A selected dataset scope excludes
+separately permissioned database connections; `--all-readable` explicitly searches the
+caller's full authorized catalog. These options do not change capture, identities or
+permissions. Route results list capabilities. Never use browse/read on a tool connection
+that lacks document capabilities. Partial failures and routing misses are not proof of
+absence. Older servers must be upgraded; do not fall back to owner credentials or scripts.

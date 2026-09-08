@@ -136,6 +136,19 @@ export const CogneeOpenCodePlugin: Plugin = async (ctx, options) => {
 
     // 4. Custom tools
     tool: {
+      cognee_search_sources: tool({
+        description: "Search connected sources using the caller's Cognee permissions. The SDK discovers datasets, node sets and database connections and selects native document or read-only SQL retrieval. Use for source questions; session/project recall remains cognee_search.",
+        args: {
+          query: tool.schema.string(),
+          source: tool.schema.string().optional().describe("Optional source hint; names come from server metadata"),
+          dataset_ids: tool.schema.array(tool.schema.string()).optional().describe("Optional dataset UUID restriction; excludes database connections"),
+          include_connections: tool.schema.boolean().optional().describe("Allow authorized live read-only queries (default true)"),
+        },
+        async execute(args) {
+          return JSON.stringify(await client.searchSources({query: args.query, sourceHint: args.source,
+            datasetIds: args.dataset_ids, includeConnections: args.include_connections}));
+        },
+      }),
       cognee_remember: tool({
         description: "Save custom facts, user preferences, or project details into long-term Cognee memory",
         args: {

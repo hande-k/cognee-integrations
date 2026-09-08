@@ -9,7 +9,8 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test-source-search.mjs"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.0.0",

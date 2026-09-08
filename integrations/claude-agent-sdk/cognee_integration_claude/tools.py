@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from typing import Any, List, Optional
 
@@ -56,6 +57,7 @@ def cognee_tools(
     *,
     remember_kwargs: Optional[dict] = None,
     recall_kwargs: Optional[dict] = None,
+    source_search_kwargs: Optional[dict] = None,
 ) -> list:
     """Build the ``remember``/``recall`` MCP tools for ``create_sdk_mcp_server``.
 
@@ -84,4 +86,20 @@ def cognee_tools(
         results = await recall(query_text, **rec_kwargs)
         return {"content": [{"type": "text", "text": f"Result: {render_results(results)}"}]}
 
-    return [remember_tool, recall_tool]
+    @tool(
+        "search_sources",
+        "Search authorized connected sources. Cognee discovers datasets, node "
+        "sets and database tools, then selects native document or read-only SQL "
+        "retrieval. Source names come from metadata.",
+        {"query": str, "source_hint": str},
+    )
+    async def source_search_tool(args):
+        # Explicit binding is separate from session capture/recall kwargs.
+        options = {"user": rec_kwargs["user"]} if rec_kwargs.get("user") is not None else {}
+        options.update(source_search_kwargs or {})
+        result = await cognee.sources.search(
+            args["query"], source_hint=args.get("source_hint") or None, **options
+        )
+        return {"content": [{"type": "text", "text": json.dumps(result, default=str)}]}
+
+    return [remember_tool, recall_tool, source_search_tool]

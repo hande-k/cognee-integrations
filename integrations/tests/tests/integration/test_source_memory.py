@@ -112,3 +112,24 @@ def test_blocked_identity_cannot_fall_back_to_cached_owner(memory):
     memory.pc.block_cached_agent_key("agent-test-key")
     with pytest.raises(RuntimeError, match="reconnect"):
         memory.resolve()
+
+
+def test_source_sql_result_uses_agent_key_without_chunk_fallback(memory, httpserver):
+    expected = {
+        "evidence": [
+            {
+                "retrieval_method": "sql",
+                "structured": {"sql": "SELECT COUNT(*) FROM orders", "rows": [{"count": 9}]},
+            }
+        ],
+        "errors": [],
+        "coverage": {"complete": False},
+    }
+    httpserver.expect_request(
+        "/api/v1/datasets/source-search", method="POST", headers={"X-Api-Key": "agent-test-key"}
+    ).respond_with_json(expected)
+    args = memory.parser().parse_args(
+        ["search", "How many orders?", "--source", "arbitrary warehouse"]
+    )
+    assert memory.run(args) == expected
+    httpserver.check_assertions()

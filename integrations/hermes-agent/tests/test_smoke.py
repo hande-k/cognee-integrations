@@ -18,6 +18,7 @@ def test_provider_imports():
         "cognee_forget",
         "cognee_switch_dataset",
         "cognee_code_search",
+        "cognee_search_sources",
     }
 
 

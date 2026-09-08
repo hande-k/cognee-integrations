@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 
 import { forgetProject } from "./commands/forget";
 import { indexWorkspace } from "./commands/indexWorkspace";
+import { searchSourcesCommand } from "./commands/searchSources";
 import { recallCommand } from "./commands/recall";
 import { rememberFile, rememberNote, rememberSelection } from "./commands/remember";
 import { setup } from "./commands/setup";
@@ -31,6 +32,10 @@ export function activate(context: vscode.ExtensionContext): void {
       if (runtime) {
         await rememberNote(runtime);
       }
+    }),
+    vscode.commands.registerCommand("cognee.searchSources", async () => {
+      const runtime = await resolveRuntime(context, logger);
+      if (runtime) await searchSourcesCommand(runtime);
     }),
     vscode.commands.registerCommand("cognee.recall", async () => {
       const runtime = await resolveRuntime(context, logger);

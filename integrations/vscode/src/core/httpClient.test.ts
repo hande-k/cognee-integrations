@@ -109,3 +109,14 @@ describe("HttpCogneeClient.forget", () => {
     expect(body).toEqual({ dataset: "vscode_abc", memory_only: true });
   });
 });
+
+it("source search preserves SQL results, scopes and the caller's key", async () => {
+  const result = {evidence: [{retrieval_method: "sql", structured: {sql: "SELECT 1", rows: [{n: 1}]}}]};
+  const {fetch, calls} = stubFetch(() => Response.json(result));
+  const client = new HttpCogneeClient({endpoint: "http://localhost:8011", apiKey: "agent-key", fetch});
+  expect(await client.searchSources("count", {sourceHint: "custom warehouse", includeConnections: false})).toEqual(result);
+  expect(calls).toHaveLength(1);
+  expect(calls[0].url).toContain("/api/v1/datasets/source-search");
+  expect(headerValue(calls[0].init, "X-Api-Key")).toBe("agent-key");
+  expect(JSON.parse(calls[0].init.body as string)).toMatchObject({source_hint: "custom warehouse", include_connections: false});
+});

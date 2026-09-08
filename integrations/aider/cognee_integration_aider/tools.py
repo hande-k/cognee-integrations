@@ -89,3 +89,12 @@ def get_sessionized_cognee_tools(session: str) -> tuple[Callable, Callable]:
         functools.partial(add_project_memory, session),
         functools.partial(search_project_memory, session),
     )
+
+
+async def search_sources(query: str, *, source_hint: str | None = None, **kwargs) -> dict:
+    """Explicit connected-source search, separate from isolated project recall.
+
+    Uses cognee.serve() when connected. Pass dataset_ids to narrow reads, or
+    include_connections=False to exclude live SQL. Never changes session writes.
+    """
+    return await cognee.sources.search(query, source_hint=source_hint, **kwargs)
