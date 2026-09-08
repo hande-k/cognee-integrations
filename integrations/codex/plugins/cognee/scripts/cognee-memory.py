@@ -67,25 +67,34 @@ def selection(args, runtime):
         return [uuid(value) for value in args.dataset_id]
     if args.dataset:
         raise MemoryError("Use --dataset-id for source search; names can collide across owners.")
-    fields, _ = recall_fields(runtime["dataset"], ["graph"])
-    return fields.get("dataset_ids")
+    saved = pc.load_graph_read_scope()
+    if saved is not None:
+        return saved
+    if os.environ.get("COGNEE_PLUGIN_READ_DATASET_IDS", "").strip():
+        fields, _ = recall_fields(runtime["dataset"], ["graph"])
+        return fields.get("dataset_ids")
+    return None
 
 
 def readable_selection(client, args, runtime):
     if getattr(args, "all_readable", False) and not (args.dataset_id or args.dataset):
         return None
     ids = selection(args, runtime)
+    if ids == []:
+        # An explicitly empty saved selection means write-dataset-only.
+        ident = pc.parse_dataset_id(runtime["dataset"])
+        if ident:
+            return [ident]
+        rows = client.request("/api/v1/datasets/")
+        matches = [row["id"] for row in rows if row.get("name") == runtime["dataset"]]
+        if len(matches) != 1:
+            raise MemoryError("Select graph read dataset UUIDs with memory-access.py first.")
+        return matches
     if ids is not None:
         return ids
-    # A named source is an explicit request to discover that source among all
-    # readable datasets. General questions respect the saved graph read selection.
-    if getattr(args, "source", None) or getattr(args, "all_readable", False):
-        return None
-    rows = client.request("/api/v1/datasets/")
-    matches = [r["id"] for r in rows if r.get("name") == runtime["dataset"]]
-    if len(matches) != 1:
-        raise MemoryError("Select graph read dataset UUIDs with memory-access.py first.")
-    return matches
+    # Explicit memory questions discover all readable sources when no narrower
+    # read selection exists. Capture hooks retain their separate write scope.
+    return None
 
 
 def discover(client, ids=None, offset=0, limit=50):
@@ -136,9 +145,7 @@ def search(client, args, runtime):
             args.code_query or "",
         )
     if args.source and (args.node_set or args.exact):
-        raise MemoryError(
-            "Use a source hint OR exact targets; inspect sources to refine targets."
-        )
+        raise MemoryError("Use a source hint OR exact targets; inspect sources to refine targets.")
     if args.node_set or args.exact:
         ids = readable_selection(client, args, runtime)
         if not ids:
@@ -217,6 +224,13 @@ def search(client, args, runtime):
     return {
         "mode": "search",
         "source": "stored_cognee_memory",
+        "next_step": None
+        if evidence
+        else (
+            "No ranked chunks were returned. If a selected target has stored documents, "
+            "browse its source ID and read relevant originals before concluding memory is empty. "
+            "Stored documents and semantic indexing have separate availability."
+        ),
         "routing": routing,
         "evidence": evidence,
         "coverage": {

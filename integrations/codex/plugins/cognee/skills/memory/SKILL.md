@@ -88,8 +88,8 @@ python3 "${CODEX_PLUGIN_ROOT}/scripts/memory-access.py" read --persist --dataset
 This selects reads, never grants access or changes writes. Include the session
 dataset UUID to retain durable session learnings in graph recall. Persistent
 selection is bound to this identity and backend; launch-specific selection wins.
-Without a selection, general search uses the write dataset. A free-form source
-hint can discover across readable datasets when no read selection exists.
+Without a read selection, explicit source searches discover across all readable
+datasets. Capture hooks keep their separate session/write scope.
 `--all-readable` explicitly expands discovery beyond the saved read selection;
 explicit `--dataset-id` values always take precedence. ACLs still apply.
 
@@ -113,6 +113,11 @@ with at most three LLM calls concurrently per routing request, followed by joint
 re-ranking. This adds LLM cost and latency. At most six targets are searched by
 default (`--max-sources`, maximum eight). Catalog limits and uncertain routing are
 reported; an empty route is NOT evidence that the answer does not exist.
+
+If no chunks are returned but a selected target has stored documents, browse that
+target and read relevant originals first. A stored document can be available before
+semantic indexing is ready. Respect response budgets and avoid dumping large
+documents into context.
 
 If evidence is insufficient, inspect the routing and catalog, refine the question
 and make one further search excluding already searched target IDs with repeated

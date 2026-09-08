@@ -114,3 +114,22 @@ def test_invalid_server_filter_result_fails_closed(memory):
     )
     with pytest.raises(memory.MemoryError, match="violates"):
         memory.search(Client(), args, {"dataset": "sessions"})
+
+
+def test_general_question_discovers_all_readable_unless_scoped(memory, monkeypatch):
+    write = str(uuid4())
+    chosen = str(uuid4())
+    args = memory.parser().parse_args(["search", "a general question"])
+    monkeypatch.setattr(memory.pc, "load_graph_read_scope", lambda: None)
+    assert memory.readable_selection(None, args, {"dataset": write}) is None
+    monkeypatch.setattr(memory.pc, "load_graph_read_scope", lambda: [chosen])
+    assert memory.readable_selection(None, args, {"dataset": write}) == [chosen]
+    args.all_readable = True
+    assert memory.readable_selection(None, args, {"dataset": write}) is None
+
+
+def test_explicit_write_only_selection_is_not_widened(memory, monkeypatch):
+    write = str(uuid4())
+    monkeypatch.setattr(memory.pc, "load_graph_read_scope", lambda: [])
+    args = memory.parser().parse_args(["search", "q"])
+    assert memory.readable_selection(None, args, {"dataset": write}) == [write]
