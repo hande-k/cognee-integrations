@@ -187,7 +187,8 @@ export class HttpCogneeClient implements CogneeClient {
       }
     }
 
-    const init: RequestInit = { method, signal: controller.signal, redirect: "error" };
+    const init: RequestInit = { method, signal: controller.signal };
+    if (path === "/api/v1/datasets/source-search") init.redirect = "error";
     if (payload?.json !== undefined) {
       init.body = JSON.stringify(payload.json);
       init.headers = this.buildHeaders({ "Content-Type": "application/json" });
