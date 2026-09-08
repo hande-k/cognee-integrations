@@ -1094,6 +1094,23 @@ def test_failure_release_cannot_split_open_contender_from_replacement_claim(
     assert not list(tmp_path.glob("*.claim"))
 
 
+def _assert_claim_is_opaque(claim: Path, *sensitive: str) -> None:
+    """The live claim carries nothing derived from the payload: a hash-only
+    name and a body that is the owner's single lock byte.
+
+    Its owner holds the lock while this runs. POSIX flock is advisory, so the
+    body reads normally; msvcrt's byte-range lock is mandatory, so on Windows
+    reading the (only) locked byte raises EACCES and the one-byte size is the
+    whole content check — every sensitive string is longer than that.
+    """
+    assert claim.stat().st_size == 1
+    if os.name == "nt":
+        return
+    body = claim.read_bytes()
+    for text in sensitive:
+        assert text.encode() not in body
+
+
 def test_concurrent_identical_hooks_allow_exactly_one_durable_inner_run(adapter, tmp_path):
     payload = {"conversationId": "conversation-concurrent"}
     first_runner_started = threading.Event()
@@ -1122,9 +1139,7 @@ def test_concurrent_identical_hooks_allow_exactly_one_durable_inner_run(adapter,
             claims = list(tmp_path.glob("*.claim"))
             assert len(claims) == 1
             assert re.fullmatch(r"[0-9a-f]{64}\.claim", claims[0].name)
-            claim_bytes = claims[0].read_bytes()
-            for sensitive in ("conversation-concurrent", "session-start.py"):
-                assert sensitive.encode() not in claim_bytes
+            _assert_claim_is_opaque(claims[0], "conversation-concurrent", "session-start.py")
 
             second = pool.submit(
                 adapter.run_inner_hook,
@@ -1220,14 +1235,9 @@ module.run_inner_hook(
         claims = list(marker_root.glob("*.claim"))
         assert len(claims) == 1
         assert re.fullmatch(r"[0-9a-f]{64}\.claim", claims[0].name)
-        claim_bytes = claims[0].read_bytes()
-        for sensitive in (
-            "conversation-crash-aba",
-            "session-start.py",
-            "crashed-owner",
-            "retry-a",
-        ):
-            assert sensitive.encode() not in claim_bytes
+        _assert_claim_is_opaque(
+            claims[0], "conversation-crash-aba", "session-start.py", "crashed-owner", "retry-a"
+        )
 
         retry_b = start("retry-b", hold=False)
         processes.append(retry_b)
