@@ -454,27 +454,52 @@ def resolve_active_dataset_ids(host_key: str = "") -> tuple[str, list[str]]:
     return write_id, read_ids
 
 
-def set_launch_dataset_ids(host_key: str, write_id: str, read_ids: list[str]) -> None:
+def set_launch_dataset_ids(
+    host_key: str, write_id: str, read_ids: list[str], *, dataset: str = ""
+) -> bool:
     """Record the active dataset's resolved UUIDs on the launch record.
 
-    Called by SessionStart (after the canonical dataset is resolved), by the
-    dataset switch, and by the idle watcher's periodic refresh. Never touches
-    the name/session/conn triple.
+    Called by SessionStart (after the canonical dataset is resolved) and by the
+    idle watcher's periodic refresh; the dataset switch writes its own ids
+    inside ``switch_launch_record``. Never touches the name/session/conn triple.
+
+    Serialised with the switch on the launch's switch lock, and when ``dataset``
+    is given the ids land only while the record still names that dataset: the
+    refresh resolves ids over several network calls, and a switch completing
+    meanwhile must not end up with the previous dataset's UUIDs under the new
+    name. Returns True when the record was written.
     """
     host_key = _sanitize_session_key(host_key) or get_session_key()
     if not host_key:
-        return
-    rec = _read_map_record(host_key)
-    if not rec:
-        return
-    merged = dict(rec)
-    merged["dataset_id"] = str(write_id or "").strip()
-    merged["dataset_ids"] = [str(x).strip() for x in read_ids if str(x).strip()]
-    if merged.get("dataset_id") == rec.get("dataset_id") and merged["dataset_ids"] == (
-        rec.get("dataset_ids") or []
-    ):
-        return
-    _write_map_record(host_key, merged)
+        return False
+    from _file_lock import file_lock
+
+    lock_path = _session_map_path(host_key).with_suffix(".switch.lock")
+    with file_lock(lock_path, timeout=_float_env("COGNEE_SWITCH_LOCK_TIMEOUT", 5.0)) as held:
+        if not held:
+            hook_log(
+                "launch_dataset_ids_skipped",
+                {"host_key": host_key, "reason": "switch_in_progress"},
+            )
+            return False
+        rec = _read_map_record(host_key)
+        if not rec:
+            return False
+        if dataset and str(rec.get("dataset") or "").strip() != str(dataset).strip():
+            hook_log(
+                "launch_dataset_ids_skipped",
+                {"host_key": host_key, "reason": "dataset_switched"},
+            )
+            return False
+        merged = dict(rec)
+        merged["dataset_id"] = str(write_id or "").strip()
+        merged["dataset_ids"] = [str(x).strip() for x in read_ids if str(x).strip()]
+        if merged.get("dataset_id") == rec.get("dataset_id") and merged["dataset_ids"] == (
+            rec.get("dataset_ids") or []
+        ):
+            return False
+        _write_map_record(host_key, merged)
+        return True
 
 
 def dataset_id_for(dataset: str, host_key: str = "") -> str:
@@ -670,7 +695,10 @@ def _switch_launch_record_locked(
     merged.setdefault("created_at", now)
     _write_map_record(host_key, merged)
     saved = _read_map_record(host_key)
-    if any(saved.get(key) != merged[key] for key in ("session_id", "dataset", "conn_uuid")):
+    if any(
+        saved.get(key) != merged[key]
+        for key in ("session_id", "dataset", "conn_uuid", "dataset_id", "dataset_ids")
+    ):
         raise RuntimeError("Dataset switch was not persisted; previous session remains active")
     hook_log(
         "dataset_switched",
@@ -2263,12 +2291,16 @@ def _add_agent_to_tenant_and_role(
     # The agent selects the tenant ITSELF: membership alone doesn't set its
     # active tenant, and the dataset-visibility filter compares against that.
     # create_agent copies the parent's tenant at provision time, so this is a
-    # no-op there; it matters when the tenant was created after provisioning.
+    # no-op there; it matters when the tenant was created after provisioning —
+    # the fresh-install path, where the agent is provisioned first. Without it
+    # every grant that follows is invisible to the agent, so a failure here is
+    # a wiring failure (retried on the next launch), not a warning.
     status, _ = _control_plane_request(
         "/api/v1/permissions/tenants/select", {"tenant_id": tenant_id}, api_key=agent_key
     )
     if status != 200:
         hook_log("shared_memory_agent_select_tenant_failed", {"status": status})
+        return "agent_tenant_select_failed"
     status, _ = _control_plane_request(
         f"/api/v1/permissions/users/{agent_id}/roles?role_id={role_id}",
         api_key=principal_key,
@@ -2502,14 +2534,23 @@ def ensure_shared_memory(
         ]
         if not eligible:
             created = create_dataset_via_http(principal_key, dataset)
-            if created:
-                created = {**created, "owner_id": parent_id, "created_at": ""}
-                same_name.append(created)
-                datasets.append(created)
-                role_holds |= _grant_role_on_datasets(
-                    principal_key, role_id, [created["id"]], marker
+            if not created.get("id"):
+                # The wiring itself is fine (the marker keeps its grants), but
+                # this launch has no canonical UUID to address. Report that
+                # rather than "shared" with an empty dataset_id, which would
+                # fall back to name addressing and quietly write to an
+                # agent-owned copy nobody else can see.
+                _save_shared_memory_marker(marker)
+                hook_log(
+                    "shared_memory_skipped",
+                    {"reason": "dataset_create_failed", "dataset": dataset},
                 )
-                eligible = [created]
+                return _separated("dataset_create_failed")
+            created = {**created, "owner_id": parent_id, "created_at": ""}
+            same_name.append(created)
+            datasets.append(created)
+            role_holds |= _grant_role_on_datasets(principal_key, role_id, [created["id"]], marker)
+            eligible = [created]
         if eligible:
             write_id = _pick_canonical(eligible, parent_id)["id"]
             canonical = marker.setdefault("canonical", {})
@@ -2581,9 +2622,11 @@ def refresh_shared_memory(host_key: str = "") -> bool:
     shared = resolve_shared_dataset(dataset)
     if shared["mode"] != "shared" or not shared["dataset_id"]:
         return False
-    before = resolve_active_dataset_ids(host_key)
-    set_launch_dataset_ids(host_key, shared["dataset_id"], shared["dataset_ids"])
-    return before != resolve_active_dataset_ids(host_key)
+    # ``dataset=`` pins the ids to the dataset they were resolved for: a switch
+    # that completed during the resolution above leaves the record untouched.
+    return set_launch_dataset_ids(
+        host_key, shared["dataset_id"], shared["dataset_ids"], dataset=dataset
+    )
 
 
 def plugin_identity_mode(config: dict | None = None) -> str:

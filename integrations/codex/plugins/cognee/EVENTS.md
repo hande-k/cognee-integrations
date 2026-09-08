@@ -96,6 +96,7 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `hook:dataset_ensure_redirect_failed` | `dataset.ensure_redirect_failed` |
 | `hook:dataset_ensured` | `dataset.ensured` |
 | `hook:dataset_switched` | `dataset.switched` |
+| `hook:launch_dataset_ids_skipped` | `launch.dataset_ids_skipped` |
 | `hook:dim_check_error` | `dim.check_error` |
 | `hook:drain_backoff_write_failed` | `drain.backoff_write_failed` |
 | `hook:drain_lock_error` | `drain.lock_error` |

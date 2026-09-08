@@ -594,3 +594,114 @@ def test_dataset_switch_is_serialized_per_launch(pc, monkeypatch):
     assert pc._read_map_record("host-lock")["dataset"] == "a"  # untouched
     pc.switch_launch_record("host-lock", session_id="s2", dataset="b", conn_uuid="c2")
     assert pc._read_map_record("host-lock")["dataset"] == "b"
+
+
+# ── review follow-ups (batch 2) ─────────────────────────────────────────────
+
+
+def test_switch_verification_covers_the_dataset_ids(pc, monkeypatch):
+    """A switch whose id fields did not persist is as broken as one whose name
+    did not: the verification compares the UUIDs too."""
+    pc.ensure_launch_record("host-verify", "/w", dataset="a")
+    real_write = pc._write_map_record
+
+    def _lossy_write(host_key, record):
+        real_write(host_key, {k: v for k, v in record.items() if k != "dataset_id"})
+
+    monkeypatch.setattr(pc, "_write_map_record", _lossy_write)
+    with pytest.raises(RuntimeError, match="not persisted"):
+        pc.switch_launch_record(
+            "host-verify",
+            session_id="s2",
+            dataset="b",
+            conn_uuid="c2",
+            dataset_id="ds-b",
+            dataset_ids=["ds-b"],
+        )
+
+
+def test_agent_tenant_select_failure_is_a_wiring_failure(suite, pc, bootstrap, mock_server):
+    """Visibility is filtered by the agent's ACTIVE tenant: if the agent cannot
+    select the tenant, every grant that follows is invisible to it. The wiring
+    must report that (and be retried) instead of claiming shared memory."""
+    mock_server.force_response("POST", "/api/v1/permissions/tenants/select", 500, {"detail": "x"})
+    module, run = bootstrap
+    _uid, api_key, _n, ok = run({})
+    assert ok
+    marker = pc.load_shared_memory_marker(mock_server.url)
+    assert marker["mode"] == "separated"
+    assert marker["reason"] == "agent_tenant_select_failed"
+    assert pc.resolve_active_dataset_ids("host-shared-1") == ("", [])
+    # No role membership was granted on top of a broken tenant selection.
+    agent_id = _agent_user_id(mock_server, suite)
+    assert not any(agent_id in role["members"] for role in mock_server.identity.roles.values())
+
+
+def test_canonical_dataset_creation_failure_degrades_for_that_dataset(pc, bootstrap, mock_server):
+    """The wiring survives, but a dataset whose canonical copy could not be
+    created is reported as separated (no UUID to address) rather than as
+    "shared" with an empty dataset_id — which would silently fall back to a
+    name-addressed, agent-owned copy nobody else sees."""
+    module, run = bootstrap
+    _uid, _k, _n, ok = run({})
+    assert ok and pc.load_shared_memory_marker(mock_server.url)["mode"] == "shared"
+
+    mock_server.force_response("POST", "/api/v1/datasets", 500, {"detail": "boom"})
+    outcome = pc.resolve_shared_dataset("brand_new")
+    assert outcome["mode"] == "separated"
+    assert outcome["reason"] == "dataset_create_failed"
+    assert outcome["dataset_id"] == "" and outcome["dataset_ids"] == []
+    marker = pc.load_shared_memory_marker(mock_server.url)
+    assert marker["mode"] == "shared"  # the wiring itself is intact
+    assert "brand_new" not in marker.get("canonical", {})
+    assert pc.dataset_id_for("brand_new") == ""
+
+    mock_server.clear_forced()
+    outcome = pc.resolve_shared_dataset("brand_new")
+    assert outcome["mode"] == "shared" and outcome["dataset_id"]
+    assert pc.dataset_id_for("brand_new") == outcome["dataset_id"]
+
+
+def test_refresh_does_not_land_stale_ids_on_a_switched_record(
+    pc, bootstrap, mock_server, monkeypatch
+):
+    """The idle watcher resolves ids over several network calls; a dataset
+    switch completing meanwhile must not end up with the OLD dataset's UUIDs
+    under the NEW dataset's name."""
+    module, run = bootstrap
+    _uid, _k, _n, ok = run({})
+    assert ok
+    host = "host-shared-1"
+    old_write, _old_read = pc.resolve_active_dataset_ids(host)
+    assert old_write
+
+    def _resolve_then_switch(dataset, **kwargs):
+        # The switch lands while the refresh is still resolving "agent_sessions".
+        pc.switch_launch_record(host, session_id="s2", dataset="other", conn_uuid="c2")
+        return {
+            "mode": "shared",
+            "reason": "",
+            "dataset_id": old_write,
+            "dataset_ids": [old_write],
+            "role_id": "r",
+        }
+
+    monkeypatch.setattr(pc, "resolve_shared_dataset", _resolve_then_switch)
+    assert pc.refresh_shared_memory(host) is False
+    record = pc._read_map_record(host)
+    assert record["dataset"] == "other"
+    assert pc.resolve_active_dataset_ids(host) == ("", [])
+
+
+def test_launch_ids_write_yields_to_an_in_progress_switch(pc, monkeypatch):
+    from _file_lock import file_lock
+
+    monkeypatch.setenv("COGNEE_SWITCH_LOCK_TIMEOUT", "0.1")
+    pc.ensure_launch_record("host-ids-lock", "/w", dataset="a")
+    lock_path = pc._session_map_path("host-ids-lock").with_suffix(".switch.lock")
+    with file_lock(lock_path) as held:
+        assert held
+        assert pc.set_launch_dataset_ids("host-ids-lock", "ds-a", ["ds-a"]) is False
+    assert pc.resolve_active_dataset_ids("host-ids-lock") == ("", [])
+    assert pc.set_launch_dataset_ids("host-ids-lock", "ds-a", ["ds-a"]) is True
+    assert pc.resolve_active_dataset_ids("host-ids-lock") == ("ds-a", ["ds-a"])
