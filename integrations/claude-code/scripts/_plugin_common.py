@@ -5,7 +5,6 @@ single log-to-disk helper. Hook scripts shouldn't grow heavy because
 they run on every user prompt / tool call.
 """
 
-import asyncio
 import errno
 import hashlib
 import json
@@ -15,7 +14,6 @@ import socket
 import ssl
 import subprocess
 import sys
-import threading
 import time
 import urllib.error
 import urllib.parse
@@ -48,7 +46,6 @@ _ACTIVITY_LOG = _PLUGIN_DIR / "activity.log"
 _SAVE_COUNTER = _PLUGIN_DIR / "save_counter.json"
 _SERVER_READY_MARKER = _SHARED_PLUGIN_ROOT / "server-ready.json"
 _SERVER_READY_TTL_SECONDS = 30
-_SYNC_LOCK = _PLUGIN_DIR / "sync.lock"
 # One lock file per session (see improve_session_lock): the idle watcher, the
 # store hook and the SessionEnd sync all bridge sessions, and only one of them
 # may have an improve in flight for a given session at a time.
@@ -1187,184 +1184,10 @@ def _buffer_lock():
                 hook_log("buffer_lock_release_failed", {"error": str(exc)[:200]})
 
 
-async def resolve_user(user_id: str):
-    """Resolve cached user ID to a User object, or fall back to default."""
-    if user_id:
-        try:
-            from uuid import UUID
-
-            from cognee.modules.users.methods import get_user
-
-            user = await get_user(UUID(user_id))
-            if user:
-                return user
-        except Exception as exc:
-            hook_log("resolve_user_failed", {"user_id": user_id, "error": str(exc)[:200]})
-    from cognee.modules.users.methods import get_default_user
-
-    return await get_default_user()
-
-
-# --- Embedding-dimension mismatch detection ---------------------------------
-# When the embedding model changes between writing and reading, stored vectors
-# and fresh query vectors have different dimensions, so recall silently matches
-# nothing. These helpers turn that silent miss into a one-line actionable error
-# naming both dimensions and the active embedder. Strictly best-effort and
-# fail-safe: any uncertainty returns None, preserving the normal "no matches"
-# behavior. Only valid against a *local* store this process can introspect
-# (gate callers with ``service_url_is_local``); a remote/cloud store is owned
-# by the server and isn't reflected by the in-process engine here.
-
-
 def service_url_is_local(url: str = "") -> bool:
     """True when the resolved service URL points at this machine (loopback)."""
     host = (urllib.parse.urlparse(url or _local_api_url()).hostname or "").lower()
     return host in ("localhost", "127.0.0.1", "::1", "0.0.0.0")
-
-
-async def _sample_stored_vector_dim(engine) -> Optional[int]:
-    """Sample the dimension of a stored vector from any populated collection, or None.
-
-    Enumerates the store's actual collections via the vector interface's
-    ``get_connection().table_names()`` (the same path cognee's own ``has_collection``
-    uses) rather than assuming fixed collection names, so it also covers custom
-    pipelines. Never raises: each collection is probed independently and any
-    unreadable one is skipped. Covers cognee's default local backend (LanceDB); other
-    backends whose connection can't enumerate return None and fall back to the normal
-    empty-recall path.
-    """
-    try:
-        connection = await engine.get_connection()
-        names = await connection.table_names()
-    except Exception:
-        return None
-    for name in names:
-        try:
-            collection = await engine.get_collection(name)
-            rows = await collection.query().limit(1).to_list()
-            if rows:
-                vector = rows[0].get("vector")
-                if vector is not None:
-                    return len(vector)
-        except Exception:
-            continue
-    return None
-
-
-async def embedding_dimension_mismatch_hint(engine=None) -> Optional[str]:
-    """One-line diagnostic when the stored vectors differ in size from the active
-    embedder's query vectors (so recall can never match), else None.
-
-    Best-effort and fail-safe: any error, or an indeterminate/matching dimension,
-    returns None so the caller keeps the normal empty-recall behavior. ``engine``
-    is injectable for testing.
-    """
-    try:
-        if engine is None:
-            from cognee.infrastructure.databases.vector import get_vector_engine
-
-            engine = get_vector_engine()
-        embed = getattr(engine, "embedding_engine", None)
-        if embed is None:
-            return None
-        query_dim = int(embed.get_vector_size())
-        stored_dim = await _sample_stored_vector_dim(engine)
-        if not stored_dim or not query_dim or stored_dim == query_dim:
-            return None
-        model = getattr(embed, "model", None) or "unknown-model"
-        provider = getattr(embed, "provider", None) or "unknown-provider"
-        return (
-            "Cognee recall found nothing because the embedder changed: stored vectors are "
-            f"{stored_dim}-d but the active embedder '{model}' (provider '{provider}') produces "
-            f"{query_dim}-d queries. Re-index this data with the current embedder, or set "
-            f"EMBEDDING_MODEL/EMBEDDING_DIMENSIONS back to the {stored_dim}-d model that wrote it."
-        )
-    except Exception:
-        return None
-
-
-_DIM_MEMO_FILE = _PLUGIN_DIR / "dim_check.json"
-_DIM_MEMO_TTL = 300.0  # seconds; re-probe at most this often per embedder signature
-
-
-def _embedder_signature() -> str:
-    """Cheap identity of the active embedder, read from env WITHOUT importing cognee
-    — the only query-side input to the mismatch check. A change here (model, dimension,
-    or provider) invalidates any cached probe result."""
-    return "|".join(
-        os.getenv(k, "") for k in ("EMBEDDING_MODEL", "EMBEDDING_DIMENSIONS", "EMBEDDING_PROVIDER")
-    )
-
-
-def _read_dim_memo(sig: str) -> Optional[dict]:
-    """Return the cached probe result for ``sig`` if present and fresh, else None.
-    Never raises."""
-    try:
-        data = json.loads(_DIM_MEMO_FILE.read_text(encoding="utf-8"))
-        if data.get("sig") == sig and (time.time() - float(data.get("ts", 0))) < _DIM_MEMO_TTL:
-            return data
-    except Exception:
-        pass
-    return None
-
-
-def _write_dim_memo(sig: str, message: Optional[str]) -> None:
-    """Persist a completed probe result keyed by embedder signature. Never raises."""
-    try:
-        _DIM_MEMO_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _DIM_MEMO_FILE.write_text(
-            json.dumps({"sig": sig, "message": message, "ts": time.time()}),
-            encoding="utf-8",
-        )
-    except Exception:
-        pass
-
-
-async def bounded_dim_mismatch_hint(timeout: float = 2.0) -> Optional[str]:
-    """``embedding_dimension_mismatch_hint`` made safe for the per-prompt hook path.
-
-    The probe's first step is a synchronous ``import cognee`` + ``get_vector_engine()``.
-    In the plugin's default http/local-server mode cognee is not otherwise imported, so
-    that is a cold ~1s import running *before the first await* — which a plain
-    ``asyncio.wait_for`` cannot bound (it blocks the event loop). So we run the whole
-    probe in a daemon thread and bound the *wait*: on timeout we return None and abandon
-    the daemon, so a slow import can never stall the hook or delay its process exit. The
-    completed result is memoized on disk per embedder signature (TTL-bounded) so repeated
-    empty recalls in a session don't each pay the import.
-
-    Fail-safe: any error, timeout, or indeterminate result returns None, so the caller
-    keeps the normal empty-recall behavior.
-    """
-    sig = _embedder_signature()
-    cached = _read_dim_memo(sig)
-    if cached is not None:
-        return cached.get("message")
-
-    loop = asyncio.get_running_loop()
-    future: asyncio.Future = loop.create_future()
-
-    def _settle(value: Optional[str]) -> None:
-        if not future.done():
-            future.set_result(value)
-
-    def _worker() -> None:
-        message: Optional[str] = None
-        try:
-            message = asyncio.run(embedding_dimension_mismatch_hint())
-        except Exception:
-            message = None
-        try:
-            loop.call_soon_threadsafe(_settle, message)
-        except Exception:
-            pass  # loop already closed (we timed out); the daemon's result is discarded
-
-    threading.Thread(target=_worker, name="cognee-dim-probe", daemon=True).start()
-    try:
-        message = await asyncio.wait_for(future, timeout=timeout)
-    except Exception:
-        return None
-    _write_dim_memo(sig, message)
-    return message
 
 
 def hook_log(event: str, detail: Optional[dict] = None) -> None:
@@ -1731,9 +1554,9 @@ def read_improve_state(session_id: str) -> dict:
 def record_improve_success(session_id: str, dataset: str, trigger: str) -> None:
     """Persist that an improve of ``session_id`` just succeeded.
 
-    Called by the improve functions themselves (``_run_session_improve_locked``
-    and ``config.improve_session_local``) on a confirmed submit, never by their
-    callers: the idle watcher reports success even when the per-session lock
+    Called by the improve function itself (``_run_session_improve_locked``) on a
+    confirmed submit, never by its callers: the idle watcher reports success even
+    when the per-session lock
     refused it, so recording there would stamp an improve that never landed.
     The idle/auto triggers read this back through ``improve_throttle_reason``.
     Best-effort: a write failure is logged and never fails the improve.
@@ -1796,23 +1619,22 @@ def improve_session_lock(session_id: str, owner: str):
     """Admit exactly one in-flight improve per session, machine-wide.
 
     Three paths bridge the same session — the idle watcher, ``store-to-session``,
-    and the SessionEnd sync — and the outer ``sync_lock`` is bypassed in API mode
-    (``nullcontext(True) if api_mode``), so in HTTP/cloud mode nothing stopped two
-    of them submitting the same session concurrently. The server's own per-session
-    lock then answered the loser with ``{}`` (busy), which drove a 15s retry loop
-    for up to ten minutes; concurrent writers also collide on the single-writer
-    graph/vector store ("Could not set lock on file"), leaving pipeline runs stuck
-    and the graph unwritten.
+    and the SessionEnd sync — and nothing else stops two of them submitting the
+    same session concurrently. The server's own per-session lock then answered
+    the loser with ``{}`` (busy), which drove a 15s retry loop for up to ten
+    minutes; concurrent writers also collide on the single-writer graph/vector
+    store ("Could not set lock on file"), leaving pipeline runs stuck and the
+    graph unwritten.
 
     So claim locally BEFORE submitting: the loser skips entirely rather than
     waiting, because the winner is already bridging the very same session — the
     work is not lost, it is in flight. Yields True when claimed, False when
     another process owns it.
 
-    Mirrors ``sync_lock``'s stale handling (dead pid or older than
-    ``SYNC_LOCK_STALE_SECONDS``) so a crashed worker cannot wedge a session, and
-    fails OPEN on unexpected errors — a lock we cannot manage must never be the
-    reason a session goes unsynced.
+    Stale handling (dead pid or older than ``SYNC_LOCK_STALE_SECONDS``) means a
+    crashed worker cannot wedge a session, and the lock fails OPEN on unexpected
+    errors — a lock we cannot manage must never be the reason a session goes
+    unsynced.
     """
     if not session_id:
         yield True
@@ -1861,47 +1683,6 @@ def improve_session_lock(session_id: str, owner: str):
                 lock_path.unlink()
             except Exception as exc:
                 hook_log("improve_lock_release_failed", {"error": str(exc)[:200]})
-
-
-@contextmanager
-def sync_lock(owner: str):
-    """Best-effort cross-hook lock for graph sync/improve work."""
-    acquired = False
-    try:
-        _PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
-        now = datetime.now(timezone.utc).timestamp()
-        if _SYNC_LOCK.exists():
-            try:
-                current = json.loads(_SYNC_LOCK.read_text(encoding="utf-8"))
-                created_at = float(current.get("created_at", 0))
-                pid = int(current.get("pid", 0))
-            except Exception as exc:
-                hook_log("sync_lock_read_failed", {"owner": owner, "error": str(exc)[:200]})
-                created_at = 0
-                pid = 0
-            pid_alive = False
-            if pid > 0:
-                pid_alive = _proc.pid_alive(pid)
-            if not pid_alive or now - created_at > SYNC_LOCK_STALE_SECONDS:
-                try:
-                    _SYNC_LOCK.unlink()
-                except Exception as exc:
-                    hook_log("sync_lock_unlink_failed", {"owner": owner, "error": str(exc)[:200]})
-        try:
-            fd = os.open(str(_SYNC_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump({"owner": owner, "pid": os.getpid(), "created_at": now}, fh)
-            acquired = True
-            yield True
-        except FileExistsError:
-            hook_log("sync_lock_busy", {"owner": owner})
-            yield False
-    finally:
-        if acquired:
-            try:
-                _SYNC_LOCK.unlink()
-            except Exception as exc:
-                hook_log("sync_lock_release_failed", {"owner": owner, "error": str(exc)[:200]})
 
 
 def _local_api_url_with_source() -> tuple[str, str]:
@@ -3977,19 +3758,23 @@ def mark_update_notified(version: str) -> None:
 
 
 def resolve_runtime_mode() -> dict:
-    """Resolve hook runtime mode from effective endpoint auth."""
+    """Resolve the hook's server endpoint and auth.
+
+    The hooks are HTTP clients only, so ``mode`` is always ``"http"``; it is kept
+    in the result (and in the ``mode_decision`` log lines) for log-consumer
+    compatibility. ``_local_api_url_with_source`` always yields a URL — the
+    localhost default when nothing is configured — so there is no in-process
+    fallback to select. An API key is optional auth, sent when present.
+    """
     service_url_raw, url_source = _local_api_url_with_source()
     service_url = _normalize_service_url(service_url_raw)
     api_key, key_source = _api_key_with_source(service_url)
-    # A configured service URL alone selects HTTP mode; an API key is no longer
-    # required to decide whether to talk to a server (it's still sent when present).
-    mode = "http" if service_url else "local_sdk"
     if service_url:
         os.environ["COGNEE_BASE_URL"] = service_url
     if api_key:
         os.environ["COGNEE_API_KEY"] = api_key
     return {
-        "mode": mode,
+        "mode": "http",
         "base_url": service_url,
         "api_key_present": bool(api_key),
         "url_source": url_source,

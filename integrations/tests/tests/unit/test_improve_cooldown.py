@@ -20,6 +20,7 @@ Contract:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 
 import pytest
@@ -156,6 +157,18 @@ def store(suite, hook_module, monkeypatch):
     return module
 
 
+def _fire(store, dataset, session_id, reason):
+    """Call ``_fire_improve_background`` across suite signatures.
+
+    Claude Code and Codex dropped the SDK ``user`` argument with the in-process
+    path (SDK-579); Antigravity still carries it. Pass it only when accepted.
+    """
+    params = inspect.signature(store._fire_improve_background).parameters
+    if "user" in params:
+        return store._fire_improve_background(dataset, session_id, None, reason=reason)
+    return store._fire_improve_background(dataset, session_id, reason=reason)
+
+
 def test_auto_fire_skips_a_throttled_session(store, monkeypatch):
     events, improves = [], []
     monkeypatch.setattr(
@@ -167,7 +180,7 @@ def test_auto_fire_skips_a_throttled_session(store, monkeypatch):
         store, "run_session_improve", lambda *a, **k: improves.append((a, k)) or True
     )
 
-    asyncio.run(store._fire_improve_background("ds", "sid", None, reason="turn_150"))
+    asyncio.run(_fire(store, "ds", "sid", reason="turn_150"))
 
     assert improves == []
     assert events == [
@@ -184,6 +197,6 @@ def test_auto_fire_runs_with_the_auto_trigger_when_not_throttled(store, monkeypa
         store, "run_session_improve", lambda *a, **k: improves.append((a, k)) or True
     )
 
-    asyncio.run(store._fire_improve_background("ds", "sid", None, reason="turn_150"))
+    asyncio.run(_fire(store, "ds", "sid", reason="turn_150"))
 
     assert improves == [(("ds", "sid"), {"trigger": "auto"})]

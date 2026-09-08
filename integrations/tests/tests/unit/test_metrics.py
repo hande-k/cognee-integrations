@@ -2,8 +2,9 @@
 
 Everything is derived from mock local files in a temp dir — no network, no real
 plugin state. Fixtures use the SAME schemas the plugin actually writes: hook.log
-lines are {ts, pid, event, detail}; mode_decision.detail.mode is "local_sdk" or
-"http"; warmup-buffered saves log "store_buffered_warming"; recall-audit.log /
+lines are {ts, pid, event, detail}; mode_decision.detail.mode is "http" (or
+"local_sdk" in logs written before the in-process path was removed);
+warmup-buffered saves log "store_buffered_warming"; recall-audit.log /
 save_counter.json / last_recall.json match their writers.
 
 Migrated from {claude-code,codex}/tests/test_metrics.py.
@@ -61,7 +62,9 @@ def test_empty_dir_returns_zeros(cognee_plugin, state_dir):
 
 
 def test_mode_split_counts_local_sdk_as_local(cognee_plugin, state_dir):
-    # Regression: resolve_runtime_mode() emits "local_sdk", never "local".
+    # Historical hook.log lines: resolve_runtime_mode() used to emit "local_sdk"
+    # for the since-removed in-process path (never "local"). Current hooks
+    # always emit "http"; old logs must still split correctly.
     _write_jsonl(
         state_dir / "hook.log",
         _hook("mode_decision", hook="store-user-prompt", mode="local_sdk"),

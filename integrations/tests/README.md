@@ -301,10 +301,10 @@ Four things worth knowing, each of which would bite:
   not by a `-m` expression in CI. Those 8 scenarios kill the server; relying on the
   caller to pass the right marker means one forgotten flag points them at a real
   tenant.
-- **The cloud backend needs no venv.** `ensure_cognee_ready` returns after an HTTP
-  `/health` check when a base_url is set — the `import cognee` is in the local-SDK
-  branch below it — so the hooks are stdlib HTTP throughout. That is why the cloud
-  CI job has no cache step and a shorter timeout.
+- **The cloud backend needs no venv.** The hooks never import cognee; every call
+  is stdlib HTTP to the configured server (`ensure_cognee_ready` is just a
+  `/health` check). That is why the cloud CI job has no cache step and a shorter
+  timeout.
 - **Cleanup is `DELETE /api/v1/datasets`**, the delete-everything route, run at both
   ends of the session. Each test invents a `live_<uuid>` dataset; locally they die
   with the temp HOME, on cloud they persist forever. Wiping on the way *in* covers

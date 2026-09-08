@@ -17,7 +17,6 @@ import signal
 import subprocess
 import sys
 import time
-from contextlib import nullcontext
 from pathlib import Path
 
 # Add scripts dir to path for config/_plugin_common imports
@@ -28,21 +27,12 @@ from _plugin_common import (
     http_api_ready,
     load_resolved,
     resolve_session_key_from_payload,
-    resolve_user,
     resolved_http_endpoint_auth,
     run_session_improve,
     set_session_key,
-    sync_lock,
     unregister_agent_via_http,
 )
-from config import (
-    ensure_cognee_ready,
-    ensure_dataset_ready,
-    get_dataset,
-    get_session_id,
-    improve_session_local,
-    load_config,
-)
+from config import get_dataset, get_session_id, load_config
 
 _STATE_DIR = Path.home() / ".cognee-plugin" / "claude-code"
 _WATCHER_PID = _STATE_DIR / "watcher.pid"
@@ -317,77 +307,48 @@ async def _sync(
             _stop_idle_watcher()
             hook_log("sync_stopped_watcher", {"session": session_id, "dataset": dataset})
 
-        config = load_config()
-        api_mode = http_api_ready()
-        lock = nullcontext(True) if api_mode else sync_lock("sync-session-to-graph")
-        with lock as acquired:
-            if not acquired:
-                hook_log("sync_skipped_lock_busy", {"session": session_id, "dataset": dataset})
-                print("cognee-sync: skipped, another sync is running", file=sys.stderr)
-                if strict:
-                    raise RuntimeError("another sync is running")
-                return
+        if not targets:
+            hook_log("sync_no_target_sessions", {"dataset": dataset})
+            return
 
-            if not targets:
-                hook_log("sync_no_target_sessions", {"dataset": dataset})
-                return
+        if not http_api_ready():
+            # No server auth resolved: there is nothing to submit the improve to.
+            # Surface it loudly on the strict (final) path so the detached worker
+            # retries instead of silently reporting success.
+            hook_log("sync_skipped_no_auth", {"session": session_id, "dataset": dataset})
+            print("cognee-sync: skipped, no server credentials resolved", file=sys.stderr)
+            if strict:
+                raise RuntimeError("no server credentials resolved")
+            return
 
-            incomplete: list[str] = []
-            # The final (strict) sync must always run; a manual /cognee-sync too.
-            # Only the idle and auto triggers honour the improve cooldown.
-            trigger = "final" if strict else "manual"
-            if api_mode:
-                for sid, ds in targets:
-                    wrote = run_session_improve(ds, sid, trigger=trigger)
-                    if not wrote:
-                        incomplete.append(f"{ds}:{sid}")
-                    hook_log(
-                        "sync_bridge_done",
-                        {
-                            "session": sid,
-                            "dataset": ds,
-                            "via": "http_improve",
-                            "wrote": wrote,
-                        },
-                    )
-                    print(
-                        f"cognee-sync: dataset={ds} session={sid} via=http_improve wrote={wrote}",
-                        file=sys.stderr,
-                    )
-                if strict and incomplete:
-                    # The detached final worker retries on exceptions only. This
-                    # is the session's LAST sync — an incomplete one (failed
-                    # improve or undelivered warmup entries) must re-drive the
-                    # whole drain+improve, not silently report success.
-                    raise RuntimeError(
-                        f"final session sync incomplete for: {', '.join(incomplete)}"
-                    )
-                return
-
-            await ensure_cognee_ready(config)
-            user = await resolve_user(user_id)
-            for sid, ds in targets:
-                await ensure_dataset_ready(ds, user)
-                result = await improve_session_local(ds, sid, user, trigger=trigger)
-                if not result.get("ok"):
-                    incomplete.append(f"{ds}:{sid}")
-                hook_log(
-                    "sync_bridge_done",
-                    {
-                        "session": sid,
-                        "dataset": ds,
-                        "user_id": str(getattr(user, "id", "")),
-                        "via": "local_improve",
-                        "ok": bool(result.get("ok")),
-                    },
-                )
-                print(
-                    f"cognee-sync: dataset={ds} session={sid} "
-                    f"via=local_improve ok={result.get('ok')}",
-                    file=sys.stderr,
-                )
-            if strict and incomplete:
-                raise RuntimeError(f"final session sync incomplete for: {', '.join(incomplete)}")
+        incomplete: list[str] = []
+        # The final (strict) sync must always run; a manual /cognee-sync too.
+        # Only the idle and auto triggers honour the improve cooldown. The server
+        # serializes improves per session itself, so no cross-hook lock is taken.
+        trigger = "final" if strict else "manual"
+        for sid, ds in targets:
+            wrote = run_session_improve(ds, sid, trigger=trigger)
+            if not wrote:
+                incomplete.append(f"{ds}:{sid}")
+            hook_log(
+                "sync_bridge_done",
+                {
+                    "session": sid,
+                    "dataset": ds,
+                    "via": "http_improve",
+                    "wrote": wrote,
+                },
+            )
+            print(
+                f"cognee-sync: dataset={ds} session={sid} via=http_improve wrote={wrote}",
+                file=sys.stderr,
+            )
+        if strict and incomplete:
+            # The detached final worker retries on exceptions only. This is the
+            # session's LAST sync — an incomplete one (failed improve or
+            # undelivered warmup entries) must re-drive the whole drain+improve,
+            # not silently report success.
+            raise RuntimeError(f"final session sync incomplete for: {', '.join(incomplete)}")
     finally:
         if unregister_on_finish:
             if not (was_registered or has_api_key):

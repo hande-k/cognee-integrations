@@ -94,9 +94,10 @@ def _compute_metrics(plugin_dir: Path) -> dict:
             if isinstance(sid, str) and sid:
                 unique_sessions.add(sid)
 
-        # Mode decisions. resolve_runtime_mode() emits "http" (cloud) or
-        # "local_sdk" (local); count any non-http mode as local so the split
-        # stays correct if another local mode name is ever added.
+        # Mode decisions. Current hooks always emit "http" (the plugin is an
+        # HTTP client to a local or remote server); older logs may carry
+        # "local_sdk" from the removed in-process path. Count any non-http
+        # mode as local so historical logs still split correctly.
         if ev == "mode_decision":
             mode = detail.get("mode", "")
             if mode == "http":

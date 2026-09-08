@@ -167,11 +167,11 @@ def live_home(tmp_path: Path, live_backend: str) -> Path:
     suite keeps its own state subdirectory beneath it. Cross-suite tests need one
     HOME holding every participating suite, so this must not depend on ``live_suite``.
 
-    The cloud backend needs no venv at all. ``ensure_cognee_ready`` returns after an
-    HTTP ``/health`` check when a base_url is configured — the ``import cognee``
-    lives in the local-SDK branch below it — so the hooks talk to the tenant over
-    stdlib HTTP and never load the package. Skipping the seed is what makes the
-    cloud job the fast one: no venv build, no cache step.
+    The cloud backend needs no venv at all. The hooks never import cognee — every
+    call is stdlib HTTP to the configured server (``ensure_cognee_ready`` is just
+    a ``/health`` check) — so they talk to the tenant without loading the package.
+    Skipping the seed is what makes the cloud job the fast one: no venv build, no
+    cache step.
     """
     home = tmp_path / "home"
     home.mkdir(parents=True, exist_ok=True)

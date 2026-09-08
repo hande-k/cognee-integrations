@@ -2,8 +2,8 @@
 
 The regression this locks down was root-caused from a real hook.log: the idle
 watcher, ``store-to-session`` and the SessionEnd sync all bridge sessions, and
-the outer ``sync_lock`` is bypassed in API mode
-(``nullcontext(True) if api_mode``). 67% of sessions were submitted by two
+nothing else serialized them (the old cross-hook ``sync_lock`` only ever
+applied to the since-removed in-process SDK path). 67% of sessions were submitted by two
 processes at once; the server's own per-session lock answered the loser with
 ``{}`` (busy), driving a 15s retry loop for up to ten minutes, while concurrent
 writers collided on the single-writer graph store ("Could not set lock on file")

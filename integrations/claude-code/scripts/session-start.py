@@ -63,9 +63,7 @@ from config import (
     _cloud_http_request,
     _user_id_via_api,
     ensure_cognee_ready,
-    ensure_dataset_ready,
     ensure_dataset_ready_via_api,
-    ensure_identity,
     get_dataset,
     is_cloud_mode,
     load_config,
@@ -1434,8 +1432,8 @@ async def _run_heavy(
 
     # On a cold start this worker began under the host python3, so the
     # _plugin_common import-time guard could not re-exec us. The boot above
-    # (via ensure_cognee_installed) has now built the venv, so flip into it
-    # before any cognee/aiohttp import below resolves against the host. No-op
+    # (via ensure_cognee_installed) has now built the venv, so flip into it so
+    # the rest of this bootstrap runs under the plugin-owned interpreter. No-op
     # when the venv is absent (connect/managed mode never builds one) or when
     # we are already inside it (warm start).
     _reexec_into_venv()
@@ -1508,21 +1506,12 @@ async def _run_heavy(
                     {"reason": "probe returned no verdict after registration failure"},
                 )
             return "", "", False
-    else:
-        # Local SDK fallback path.
-        try:
-            if not user_id:
-                user_id, fallback_key = await ensure_identity(config)
-                if fallback_key and not agent_api_key:
-                    agent_api_key = fallback_key
-        except Exception as e:
-            print(f"cognee-plugin: identity warning ({e})", file=sys.stderr)
 
     try:
         # Cloud: the API key IS the identity (the server derives the principal
         # from X-Api-Key), so dataset creation must NOT be gated on user_id —
         # servers without /users/me (e.g. cloud tenants) leave user_id empty
-        # while auth works fine. Only the SDK branch below needs a User object.
+        # while auth works fine.
         # Under shared memory the canonical dataset was already resolved (and
         # created as the parent when absent) by the credential step; creating
         # it here as the agent would fork an agent-owned copy of the same name.
@@ -1534,13 +1523,6 @@ async def _run_heavy(
                 agent_api_key or config.get("api_key", ""),
                 dataset,
             )
-        elif user_id:
-            from uuid import UUID
-
-            from cognee.modules.users.methods import get_user
-
-            user = await get_user(UUID(user_id))
-            await ensure_dataset_ready(dataset, user)
     except Exception as e:
         print(f"cognee-plugin: dataset warning ({e})", file=sys.stderr)
         if is_cloud_mode(config):

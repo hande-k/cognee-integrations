@@ -10,6 +10,46 @@ Code only offers an update when that string changes. Tag releases as
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.1]
+
+### Removed
+- **The in-process "local SDK" execution path is gone.** Every hook is now an
+  HTTP client to the Cognee server (the one the plugin boots on localhost, or a
+  remote one via `COGNEE_BASE_URL`); no hook imports `cognee` any more. The
+  path had been unreachable for the per-prompt hooks since endpoint resolution
+  started defaulting to the local server URL, but two places still executed
+  cognee in-process against the local server's own database files from a
+  second process: PreCompact ran the unbounded SDK `setup()` and read the
+  session cache through the session manager, and the empty-recall
+  embedding-dimension probe opened the local LanceDB directly. Deleted:
+  `config.ensure_identity` / `_ensure_identity_via_sdk` /
+  `_ensure_local_databases` / `ensure_dataset_ready` /
+  `improve_session_local` / `is_local_mode`, `_plugin_common.resolve_user`,
+  `sync_lock`, the embedding-dimension probe
+  (`bounded_dim_mismatch_hint` and helpers), the `local_sdk` runtime mode,
+  and the SDK branches in `store-to-session`, `store-user-prompt`,
+  `session-context-lookup`, `session-start`, `idle-watcher`,
+  `sync-session-to-graph` and `pre-compact`. Their log events
+  (`resolve_user_failed`, `trace_fallback_*`, `sync_lock_*`,
+  `precompact_direct_fetch_error`, `precompact_*_dump_failed`,
+  `prompt_prepare_warning`, `context_lookup_dim_mismatch`,
+  `dim_check_error`, `improve_local_unsupported`,
+  `default_user_resolve_failed`, `bridge_skipped_lock_busy`,
+  `sync_lock_import_error`, `sync_skipped_lock_busy`) are retired.
+
+### Changed
+- **PreCompact builds its anchor over HTTP.** It now resolves the endpoint like
+  every other hook (`resolve_runtime_mode`), recalls through `/api/v1/recall`,
+  and, when the empty-query seed recall returns nothing, reads the recent QA
+  and trace rows from `GET /api/v1/sessions/{id}` instead of the in-process
+  session manager. Against a remote server this is the first time the anchor
+  is produced at all: the old direct read only worked when the plugin had
+  booted the server under the same HOME. New events:
+  `precompact_server_unusable` (skipped because the server is known down),
+  `auto_improve_skipped_no_auth`, `sync_skipped_no_auth` and
+  `idle-watcher:bridge_skipped_no_auth` (an improve had no server credentials
+  to submit with; previously these fell through to the local SDK path).
+
 ## [1.5.0]
 
 ### Added
