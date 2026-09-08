@@ -120,7 +120,9 @@ def test_provision_requires_an_agent_id(suite, pc, mock_server):
     )
     status, body = pc.provision_plugin_agent_via_http(principal_key=PRINCIPAL_KEY)
     assert (status, body) == ("failed", {})
-    mock_server.assert_not_called("POST", PROVISION_PATH[suite.name])
+    # The request IS made (the forced body is what gets rejected); nothing
+    # from it may survive as a cached identity.
+    assert pc.load_cached_agent_key(mock_server.url) == ""
 
 
 def test_reprovision_does_not_rotate_the_old_key(suite, pc, mock_server):
