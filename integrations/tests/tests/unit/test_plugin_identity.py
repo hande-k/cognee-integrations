@@ -98,6 +98,28 @@ def test_provision_unsupported_on_older_server(suite, pc, mock_server):
 def test_provision_requires_a_principal_key(suite, pc, mock_server):
     status, _body = pc.provision_plugin_agent_via_http(principal_key="")
     assert status == "failed"
+
+
+def test_provision_rejects_the_principal_key_handed_back_as_the_agent_key(suite, pc, mock_server):
+    """A server that returns the caller's own key would leave no isolation at
+    all — and the principal resolvers skip the agent cache, so the launch
+    would end up keyless. That is a bad response, not an identity."""
+    mock_server.force_response(
+        "POST",
+        PROVISION_PATH[suite.name],
+        200,
+        {"apiKey": PRINCIPAL_KEY, "agentId": "agent-x", "created": True},
+    )
+    status, body = pc.provision_plugin_agent_via_http(principal_key=PRINCIPAL_KEY)
+    assert (status, body) == ("failed", {})
+
+
+def test_provision_requires_an_agent_id(suite, pc, mock_server):
+    mock_server.force_response(
+        "POST", PROVISION_PATH[suite.name], 200, {"apiKey": "agentkey-zzz", "created": True}
+    )
+    status, body = pc.provision_plugin_agent_via_http(principal_key=PRINCIPAL_KEY)
+    assert (status, body) == ("failed", {})
     mock_server.assert_not_called("POST", PROVISION_PATH[suite.name])
 
 

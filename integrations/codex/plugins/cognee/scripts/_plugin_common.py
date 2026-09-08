@@ -4203,17 +4203,32 @@ def provision_plugin_agent_via_http(
             api_key=principal_key,
             base_url=service_url or _local_api_url(),
         )
+        reason = "not_an_object"
         if isinstance(result, dict):
             body = {
                 "api_key": str(result.get("api_key") or result.get("apiKey") or "").strip(),
                 "agent_id": str(result.get("agent_id") or result.get("agentId") or ""),
                 "created": bool(result.get("created")),
             }
-            if body["api_key"] and body["created"]:
+            if not (body["api_key"] and body["created"]):
+                reason = "incomplete"
+            elif not body["agent_id"]:
+                # Shared memory wires the agent by id; without one the launch
+                # would provision, then report ``no_agent_identity``.
+                reason = "missing_agent_id"
+            elif body["api_key"] == str(principal_key or "").strip():
+                # The caller's own key handed back as the "agent" key: no
+                # isolation at all, and the principal resolvers skip whatever
+                # the agent cache holds, so the launch would end up keyless.
+                reason = "agent_key_equals_principal"
+            else:
                 return "provisioned", body
         hook_log(
             "plugin_provision_bad_response",
-            {"keys": sorted(result) if isinstance(result, dict) else str(type(result))},
+            {
+                "reason": reason,
+                "keys": sorted(result) if isinstance(result, dict) else str(type(result)),
+            },
         )
         return "failed", {}
     except urllib.error.HTTPError as exc:

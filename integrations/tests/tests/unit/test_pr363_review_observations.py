@@ -73,6 +73,22 @@ def test_federated_graph_recall_does_not_reuse_session_binding(
     assert calls[-1]["session_id"] == "active" and calls[-1]["datasets"] == ["owned"]
 
 
+def test_malformed_read_dataset_ids_env_names_the_setting(suite, isolated_modules, monkeypatch):
+    """Broken JSON in COGNEE_PLUGIN_READ_DATASET_IDS is a configuration error
+    that says so, not a bare JSON traceback from inside the recall."""
+    pc = isolated_modules(suite, "_plugin_common")
+    monkeypatch.setenv("COGNEE_PLUGIN_READ_DATASET_IDS", "[invalid")
+    monkeypatch.setattr(pc, "_json_http_request", lambda *a, **kw: pytest.fail("request sent"))
+    with pytest.raises(ValueError, match="COGNEE_PLUGIN_READ_DATASET_IDS is not valid JSON"):
+        pc.recall_via_http("question", session_id="active", top_k=3, scope=["graph"], dataset="d")
+    # Session-scoped recall never reads the federated setting.
+    monkeypatch.setattr(pc, "_json_http_request", lambda *a, **kw: [])
+    assert (
+        pc.recall_via_http("question", session_id="active", top_k=3, scope=["session"], dataset="d")
+        == []
+    )
+
+
 def test_shared_uuid_is_used_by_write_and_registration(suite, isolated_modules, monkeypatch):
     from uuid import uuid4
 

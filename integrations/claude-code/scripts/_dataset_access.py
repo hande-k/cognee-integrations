@@ -25,7 +25,12 @@ def recall_fields(value, scope):
     if scope == ["graph"]:
         raw = os.environ.get("COGNEE_PLUGIN_READ_DATASET_IDS", "").strip()
         if raw:
-            values = json.loads(raw)
+            try:
+                values = json.loads(raw)
+            except ValueError as exc:
+                raise ValueError(
+                    f"COGNEE_PLUGIN_READ_DATASET_IDS is not valid JSON: {exc}"
+                ) from exc
             if not isinstance(values, list) or not values or not all(dataset_id(v) for v in values):
                 raise ValueError(
                     "COGNEE_PLUGIN_READ_DATASET_IDS must be a nonempty JSON list of UUIDs"
