@@ -247,10 +247,12 @@ Troubleshooting:
 
 - 401/403 errors: Check the API key and that `X-Api-Key` is accepted by your Cognee instance.
 - Connection errors: Verify Base URL and network access from your n8n host.
+- `connect ECONNREFUSED ::1:8000` against a local server: n8n runs on Node 18+, which resolves `localhost` to the IPv6 address `::1`, while a self-hosted cognee server usually listens on IPv4 only. Use `http://127.0.0.1:8000` as the Base URL instead of `http://localhost:8000`.
 
 ## Compatibility
 
-- Node.js: >= 20.15
+- Node.js at runtime: >= 20.15 (whatever your n8n instance runs on; the published package has no native dependencies)
+- Node.js for development: >= 24 (see `.nvmrc`). The dev toolchain pulls in `isolated-vm`, a native module that compiles at install time and needs Node 24 or newer, so `npm install` fails on Node 20.
 - n8n Nodes API: v1
 
 The node depends on `n8n-workflow` at runtime (peer dependency). It should work on current n8n releases supporting community nodes.
