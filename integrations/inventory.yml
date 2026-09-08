@@ -184,6 +184,21 @@ integrations:
     source_repo: https://github.com/topoteretes/cognee-integration-crewai
     notes: "CrewAI agent tools – add, search, session management"
 
+  - slug: mastra
+    name: "Memory (Cognee) for Mastra"
+    owner: cognee
+    language: typescript
+    registry: none
+    package_name: "@cognee/cognee-mastra"
+    cognee_dependency: http-api
+    current_version: "0.1.0"
+    migration_status: done
+    notes: >-
+      Cognee memory layer for Mastra agents: input/output processors for
+      automatic recall and capture, plus cognee_search / cognee_ask /
+      cognee_remember tools. Talks to a cognee server over the HTTP API
+      (/recall, /remember, /datasets, /forget); no cognee SDK dependency.
+
   # ── Chat bots & editor (memory over the cognee HTTP API) ───────────
 
   - slug: chat-memory
