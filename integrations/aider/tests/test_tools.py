@@ -99,6 +99,7 @@ async def test_source_search_delegates_to_served_sdk_without_project_mutation(mo
     from types import SimpleNamespace
 
     from cognee_integration_aider import search_sources
+
     method = AsyncMock(return_value={"evidence": [{"retrieval_method": "sql"}]})
     monkeypatch.setattr(cognee, "sources", SimpleNamespace(search=method), raising=False)
     result = await search_sources("counts", source_hint="anything", include_connections=False)

@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 
@@ -41,9 +43,8 @@ def test_render_results_handles_each_source():
     assert render_results([]) == []
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("inherited", [True, False])
-async def test_source_tool_uses_sdk_routing_and_bound_identity(monkeypatch, inherited):
+def test_source_tool_uses_sdk_routing_and_bound_identity(monkeypatch, inherited):
     import json
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
@@ -62,6 +63,6 @@ async def test_source_tool_uses_sdk_routing_and_bound_identity(monkeypatch, inhe
             else {"source_search_kwargs": {"user": user}}
         ),
     )
-    result = await tools[2].handler({"query": "counts", "source_hint": "arbitrary source"})
+    result = asyncio.run(tools[2].handler({"query": "counts", "source_hint": "arbitrary source"}))
     assert json.loads(result["content"][0]["text"])["evidence"][0]["retrieval_method"] == "sql"
     method.assert_awaited_once_with("counts", source_hint="arbitrary source", user=user)
