@@ -11,6 +11,17 @@ reports an update only when the published npm version changes. Tag releases as
 The format is based on [Keep a Changelog](https://keepachangelog.com/). Versions are
 date-based (`YYYY.M.D`), matching the OpenClaw plugin ecosystem.
 
+## [2026.9.8]
+
+### Changed
+- **Per-prompt recall waits long enough for growing graphs.** `recallTimeoutMs`
+  (per recall call) and `recallBudgetMs` (whole recall step) default to `6000` and
+  `8000`, up from `2500` and `4000`, matching the Claude Code and Codex plugins.
+  Graph search time grows with the dataset, and a call that overruns its timeout
+  contributes nothing, so the old caps could silently drop graph memory from recall
+  once a graph got large. Both remain configurable; the cheap scopes are unaffected,
+  so a fast prompt is not slower.
+
 ## [2026.9.2]
 
 ### Fixed

@@ -551,8 +551,8 @@ Recall runs on the prompt hot path, so it is bounded: each recall call gets a sh
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `recallTimeoutMs` | number | `2500` | Per recall HTTP call timeout (no retries) |
-| `recallBudgetMs` | number | `4000` | Overall wall-clock budget for the recall step per prompt |
+| `recallTimeoutMs` | number | `6000` | Per recall HTTP call timeout (no retries) |
+| `recallBudgetMs` | number | `8000` | Overall wall-clock budget for the recall step per prompt |
 | `recallBreakerThreshold` | number | `5` | Consecutive failures (network/timeout/5xx) before the breaker opens |
 | `recallBreakerCooldownMs` | number | `120000` | How long recall is skipped once the breaker opens |
 
