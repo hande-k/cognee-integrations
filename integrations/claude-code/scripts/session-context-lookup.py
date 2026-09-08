@@ -779,6 +779,20 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
     return output
 
 
+def _recall_min_prompt_chars() -> int:
+    """Prompts shorter than this skip recall (capture keeps its own 5-char floor).
+
+    COGNEE_RECALL_MIN_PROMPT_CHARS lets a host raise the floor so acknowledgements
+    and one-word nudges do not cost a lookup and an injected context block. The
+    default matches the stock gate, so an unset variable changes nothing.
+    """
+    raw = os.environ.get("COGNEE_RECALL_MIN_PROMPT_CHARS", "").strip()
+    try:
+        return max(5, int(raw)) if raw else 5
+    except ValueError:
+        return 5
+
+
 def main():
     payload_raw = sys.stdin.read()
     if not payload_raw.strip():
@@ -801,6 +815,10 @@ def main():
 
     prompt = payload.get("prompt", "")
     if not prompt or len(prompt) < 5:
+        return
+    min_chars = _recall_min_prompt_chars()
+    if len(prompt.strip()) < min_chars:
+        hook_log("context_lookup_short_prompt", {"chars": len(prompt.strip()), "min": min_chars})
         return
     cwd = str(payload.get("cwd") or "") or os.getcwd()
 
