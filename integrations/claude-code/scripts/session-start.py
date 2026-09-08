@@ -106,7 +106,7 @@ _UV_BIN = _UV_DIR / ("uv.exe" if os.name == "nt" else "uv")
 _UV_PYTHON_DIR = _GLOBAL_STATE_DIR / "python"
 _UV_INSTALL_URL = "https://astral.sh/uv/install.sh"
 _PINNED_PYTHON = os.environ.get("COGNEE_PLUGIN_PYTHON", "") or "3.12"
-_PINNED_COGNEE_VERSION = "1.5.3"
+_PINNED_COGNEE_VERSION = "1.5.4"
 _INSTALL_TIMEOUT_SECONDS = float(os.environ.get("COGNEE_INSTALL_TIMEOUT", "") or 600.0)
 
 # Maps a configured backend provider env var to the cognee package "extra" that
@@ -395,6 +395,7 @@ def ensure_cognee_installed(timeout: float = _INSTALL_TIMEOUT_SECONDS) -> bool:
                     subprocess.run(
                         [uv, "venv", str(_VENV_DIR), "--python", _PINNED_PYTHON],
                         env=env,
+                        cwd=str(_GLOBAL_STATE_DIR),
                         check=True,
                         capture_output=True,
                         text=True,
@@ -411,6 +412,7 @@ def ensure_cognee_installed(timeout: float = _INSTALL_TIMEOUT_SECONDS) -> bool:
                         _cognee_install_spec(),
                     ],
                     env=env,
+                    cwd=str(_GLOBAL_STATE_DIR),
                     check=True,
                     capture_output=True,
                     text=True,
@@ -631,6 +633,8 @@ def _ensure_local_server_running(
             hook_log("server_console_capture_unavailable", {"path": str(console_log)})
         server_proc = subprocess.Popen(
             [str(_VENV_PYTHON), "-m", "uvicorn", "cognee.api.client:app", "--port", str(port)],
+            # Import the installed runtime even when the host opened a Cognee checkout.
+            cwd=str(_VENV_DIR),
             env=server_env,
             stdin=subprocess.DEVNULL,
             stdout=pump.stdin if pump else subprocess.DEVNULL,
@@ -753,21 +757,186 @@ def _resolve_agent_name(config: dict, cwd: str) -> str:
 
 
 async def _resolve_single_principal_key(service_url: str, config: dict) -> str:
-    """Resolve the one API key for this deployment.
+    """Resolve the PRINCIPAL key for this deployment.
 
     Order: env ``COGNEE_API_KEY`` -> single cached key -> mint once from the
-    default user (and cache it). No per-agent users or keys.
-    """
-    from _plugin_common import load_cached_api_key, save_cached_api_key
+    default user (and cache it).
 
+    The provisioned plugin-agent key is explicitly NOT a principal: earlier
+    steps in this same process may have stamped it into the env / config (see
+    ``_api_key_with_source``), and provisioning authenticated as the agent
+    would nest a new agent under the agent. Skip it wherever it leaked in.
+    """
+    from _plugin_common import (
+        load_cached_agent_key,
+        load_cached_api_key,
+        save_cached_api_key,
+    )
+
+    agent_key = load_cached_agent_key(service_url)
     api_key = str(config.get("api_key", "") or os.environ.get("COGNEE_API_KEY", "")).strip()
+    if agent_key and api_key == agent_key:
+        api_key = ""
     if not api_key:
-        api_key = load_cached_api_key(service_url)
+        api_key = os.environ.get("COGNEE_PRINCIPAL_API_KEY", "") or load_cached_api_key(service_url)
     if not api_key:
         api_key = await _login_default_user_for_owner_api_key(service_url, config)
         if api_key:
             save_cached_api_key(service_url, api_key)
     return api_key
+
+
+# Shared-memory outcomes that no retry within this deployment can change: the
+# server predates the permissions API or cannot store session entries by
+# dataset UUID, the user is not the owner of its tenant, or a tenant-less user
+# already owns data (activating a tenant would hide it). Under identity mode
+# ``auto`` an install that hit one of these stays on the principal instead of
+# probing and provisioning again every launch.
+_STRUCTURAL_SHARED_MEMORY_FAILURES = frozenset(
+    {"unsupported", "typed_dataset_unsupported", "not_tenant_owner", "tenantless_with_data"}
+)
+
+
+async def _ensure_plugin_identity(service_url: str, config: dict, principal_key: str) -> str:
+    """Resolve the plugin's dedicated agent key, provisioning when the mode allows.
+
+    ``plugin_identity`` / ``COGNEE_PLUGIN_IDENTITY`` selects the policy:
+      - ``false``: principal only; a cached identity is ignored.
+      - ``true``: explicit identity. Provision (create-only — never rotating a
+        key another machine may hold) when none is cached. Anything that
+        prevents that — a server without the create-only contract, a cached
+        key bound to another principal, a key the server rejected — is an
+        error, never a silent fall back to the owner's authority.
+      - ``auto`` (default): identity in service of shared agent memory. With
+        shared memory on, provision when none is cached; the caller then wires
+        the shared role and reverts to the principal if that fails, so nothing
+        the principal owns is ever stranded. With shared memory off, or after a
+        structural shared-memory failure, stay on the principal. A blocked or
+        foreign cached key is not used: the launch runs as the principal and
+        says so in the log.
+
+    A cached key that passes its checks always wins — provisioning again would
+    rotate it out from under every other machine of this user.
+    """
+    from _plugin_common import (
+        _AGENT_KEY_CACHE,
+        _installed_plugin_version,
+        _load_json_file,
+        _principal_fingerprint,
+        load_cached_agent_key,
+        load_cached_api_key,
+        load_shared_memory_marker,
+        plugin_identity_lock,
+        plugin_identity_mode,
+        provision_plugin_agent_via_http,
+        save_cached_agent_key,
+        save_cached_api_key,
+        shared_memory_enabled,
+    )
+
+    mode = plugin_identity_mode(config)
+    if mode == "disabled":
+        return ""
+    strict = mode == "enabled"
+    with plugin_identity_lock():
+        key = load_cached_agent_key(service_url)
+        record = _load_json_file(_AGENT_KEY_CACHE)
+        if key:
+            if record.get("blocked"):
+                if strict:
+                    raise RuntimeError(
+                        "Plugin identity is disconnected; explicit reconnect is required"
+                    )
+                hook_log("plugin_identity_skipped", {"reason": "blocked"})
+                return ""
+            if record.get("principal_fingerprint") != _principal_fingerprint(principal_key):
+                if strict:
+                    raise RuntimeError(
+                        "Cached plugin identity does not match this principal; reconnect explicitly"
+                    )
+                hook_log("plugin_identity_skipped", {"reason": "principal_mismatch"})
+                return ""
+            return key
+        if not strict:
+            if not shared_memory_enabled(config):
+                return ""
+            marker = load_shared_memory_marker(service_url)
+            prior = str(marker.get("reason") or "")
+            if prior in _STRUCTURAL_SHARED_MEMORY_FAILURES:
+                # Structural for the plugin version that recorded it. After an
+                # update the limitation may be gone (server-side fixes ship
+                # with plugin bumps), so try once more instead of never again.
+                if marker.get("plugin_version") == _installed_plugin_version():
+                    hook_log("plugin_provision_skipped", {"status": "shared_memory_" + prior})
+                    return ""
+                hook_log("plugin_provision_retry_after_update", {"prior_reason": prior})
+        status, body = provision_plugin_agent_via_http(
+            principal_key=principal_key, service_url=service_url
+        )
+        if status != "provisioned":
+            if strict:
+                raise RuntimeError(
+                    f"Plugin provisioning {status}; owner fallback is disabled. "
+                    "Safe create-only SDK support is required."
+                )
+            # ``auto``: no identity on this server (no create-only contract, or
+            # an agent that already exists without a key here) — the principal
+            # sees everything anyway, so shared memory has nothing to add.
+            hook_log("plugin_provision_skipped", {"status": status})
+            return ""
+        key = str(body.get("api_key") or "").strip()
+        save_cached_agent_key(
+            service_url, key, str(body.get("agent_id") or ""), principal_key=principal_key
+        )
+        # Keep the PRINCIPAL reachable for later control-plane work (grant
+        # backfills from the idle watcher): an env-provided key only lives in
+        # this process's environment.
+        if not load_cached_api_key(service_url):
+            save_cached_api_key(service_url, principal_key)
+        config["_provisioned_now"] = True
+        hook_log(
+            "plugin_agent_provisioned",
+            {
+                "agent_id": str(body.get("agent_id") or ""),
+                "created": bool(body.get("created")),
+                "reason": "explicit" if strict else "shared_memory",
+            },
+        )
+        return key
+
+
+def _wire_shared_memory(
+    service_url: str, config: dict, principal_key: str, agent_key: str, session_key: str
+) -> dict:
+    """Run the shared-memory wiring for the active agent and pin the launch's
+    canonical dataset ids. Returns ``ensure_shared_memory``'s outcome."""
+    from _plugin_common import (
+        ensure_shared_memory,
+        hook_log,
+        load_cached_agent_id,
+        set_launch_dataset_ids,
+    )
+
+    shared = ensure_shared_memory(
+        service_url=service_url,
+        principal_key=principal_key,
+        agent_key=agent_key,
+        agent_id=load_cached_agent_id(service_url),
+        dataset=str(config.get("dataset", "") or "").strip(),
+        allow_setup=True,
+        config=config,
+    )
+    set_launch_dataset_ids(session_key, shared["dataset_id"], shared["dataset_ids"])
+    hook_log(
+        "shared_memory_resolved",
+        {
+            "mode": shared["mode"],
+            "reason": shared["reason"],
+            "dataset_id": shared["dataset_id"],
+            "read_ids": len(shared["dataset_ids"]),
+        },
+    )
+    return shared
 
 
 async def _ensure_agent_credentials_and_register(
@@ -777,25 +946,106 @@ async def _ensure_agent_credentials_and_register(
     if not service_url:
         return "", "", "", False
 
-    api_key = await _resolve_single_principal_key(service_url, config)
-    if not api_key:
+    from _plugin_common import (
+        block_cached_agent_key,
+        clear_cached_agent_key,
+        plugin_identity_mode,
+        register_agent_via_http,
+        set_launch_dataset_ids,
+    )
+
+    principal_key = await _resolve_single_principal_key(service_url, config)
+    if not principal_key:
         return "", "", "", False
+
+    os.environ["COGNEE_PRINCIPAL_API_KEY"] = principal_key
+    agent_key = await _ensure_plugin_identity(service_url, config, principal_key)
+
+    # Shared agent memory: wire the agent into the user's shared role and pin
+    # the canonical dataset ids on the launch record. Under identity mode
+    # ``auto`` the agent was provisioned only on the promise that shared memory
+    # keeps the principal's datasets reachable — if that wiring did not happen,
+    # honour the promise by staying on the principal (the agent key is dropped
+    # and its server-side key revoked; a structural reason also stops the next
+    # launch from provisioning again). An explicit identity (``true``) is kept
+    # regardless: the user asked for it.
+    shared = {
+        "mode": "separated",
+        "reason": "no_agent_identity",
+        "dataset_id": "",
+        "dataset_ids": [],
+    }
+    if agent_key:
+        shared = _wire_shared_memory(service_url, config, principal_key, agent_key, session_key)
+        if (
+            shared["mode"] != "shared"
+            and config.get("_provisioned_now")
+            and plugin_identity_mode(config) != "enabled"
+        ):
+            hook_log(
+                "plugin_identity_reverted",
+                {"reason": shared["reason"], "detail": "shared memory unavailable"},
+            )
+            from _plugin_common import disconnect_plugin_agent_via_http
+
+            # Nobody will hold the key just minted: revoke it server-side (the
+            # agent user stays for a later, successful migration).
+            disconnect_plugin_agent_via_http(principal_key=principal_key)
+            clear_cached_agent_key()
+            agent_key = ""
+            set_launch_dataset_ids(session_key, "", [])
+    api_key = agent_key or principal_key
 
     os.environ["COGNEE_API_KEY"] = api_key
     config["api_key"] = api_key
 
-    # The principal user id (best-effort) — used for dataset readiness + watchers.
+    # The effective identity's user id (best-effort) — used for dataset
+    # readiness + watchers. Under a plugin identity this is the agent
+    # sub-user, which is exactly the user the data plane operates as.
     user_id = await _user_id_via_api(service_url, api_key)
 
-    from _plugin_common import register_agent_via_http
+    def _register() -> tuple[bool, dict]:
+        # Registration is a lifecycle counter + connection registry under the
+        # effective identity. The connection handle IS the Cognee session id.
+        # Under shared memory the binding is the canonical dataset's UUID.
+        return register_agent_via_http(
+            agent_session_name=agent_session_name,
+            session_id=session_id,
+            dataset_names=[str(config.get("dataset", "") or "").strip()],
+            dataset_ids=[shared["dataset_id"]] if shared.get("dataset_id") else None,
+        )
 
-    # Registration is now purely a lifecycle counter + connection registry under
-    # the single principal. The connection handle IS the Cognee session id.
-    registered, registration = register_agent_via_http(
-        agent_session_name=agent_session_name,
-        session_id=session_id,
-        dataset_names=[str(config.get("dataset", "") or "").strip()],
-    )
+    registered, registration = _register()
+    if not registered and registration.get("auth_failed") and agent_key:
+        # The provisioned key was revoked out-of-band (dashboard disconnect or
+        # a rotation elsewhere). It is blocked so no later hook reuses it, and
+        # never re-provisioned: the create-only contract refuses an agent that
+        # already exists, and rotating would revoke another machine's key.
+        block_cached_agent_key(agent_key)
+        if plugin_identity_mode(config) == "enabled":
+            raise RuntimeError(
+                "Plugin identity rejected; automatic re-provision and owner fallback are disabled"
+            )
+        # ``auto``: this launch runs as the principal; shared memory is off
+        # until the identity is reconnected explicitly.
+        hook_log("plugin_identity_rejected_fallback", {"agent_key_blocked": True})
+        agent_key = ""
+        api_key = principal_key
+        shared = {
+            "mode": "separated",
+            "reason": "identity_rejected",
+            "dataset_id": "",
+            "dataset_ids": [],
+        }
+        set_launch_dataset_ids(session_key, "", [])
+        os.environ["COGNEE_API_KEY"] = api_key
+        config["api_key"] = api_key
+        user_id = await _user_id_via_api(service_url, api_key)
+        registered, registration = _register()
+    # Optional lifecycle routes (older / minimal servers, lifecycle_supported is
+    # False): the session runs unregistered rather than failing. Anything else
+    # is a real failure on a server that has the route — raise with the HTTP
+    # status so the caller can classify it (auth vs server error).
     if not registered and registration.get("lifecycle_supported") is not False:
         status = registration.get("status_code")
         message = f"Failed to register session '{session_id}' on {service_url}."
@@ -1258,11 +1508,16 @@ async def _run_heavy(
             return "", "", False
 
     try:
-        # The API key IS the identity (the server derives the principal from
-        # X-Api-Key), so dataset creation must NOT be gated on user_id — servers
-        # without /users/me (e.g. cloud tenants) leave user_id empty while auth
-        # works fine.
-        if is_cloud_mode(config):
+        # Cloud: the API key IS the identity (the server derives the principal
+        # from X-Api-Key), so dataset creation must NOT be gated on user_id —
+        # servers without /users/me (e.g. cloud tenants) leave user_id empty
+        # while auth works fine.
+        # Under shared memory the canonical dataset was already resolved (and
+        # created as the parent when absent) by the credential step; creating
+        # it here as the agent would fork an agent-owned copy of the same name.
+        from _plugin_common import resolve_active_dataset_ids
+
+        if is_cloud_mode(config) and not resolve_active_dataset_ids(session_key)[0]:
             await ensure_dataset_ready_via_api(
                 config.get("base_url", ""),
                 agent_api_key or config.get("api_key", ""),

@@ -40,6 +40,7 @@ ISOLATED_MODULES = (
     "_capture_policy",
     "event_names",
     "_project_memory",
+    "_dataset_access",
     "_proc",
     "_recall_http",
     "_remember_http",

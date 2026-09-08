@@ -45,10 +45,12 @@ def test_unregistration_404_is_best_effort_for_a_data_plane_only_backend(common,
 def test_non_404_lifecycle_http_errors_remain_failures(common, mock_server, status):
     """Only a missing lifecycle route is optional; auth and server failures are real."""
     mock_server.force_response("POST", _REGISTER, status, {"detail": "error"})
-    assert common.register_agent_via_http(agent_session_name="antigravity-test") == (
-        False,
-        {"status_code": status},
-    )
+    ok, detail = common.register_agent_via_http(agent_session_name="antigravity-test")
+    assert ok is False
+    assert detail["status_code"] == status
+    assert detail.get("lifecycle_supported") is not False
+    # 401/403 are also flagged so SessionStart can block a rejected plugin identity.
+    assert detail["auth_failed"] is (status in (401, 403))
 
     mock_server.force_response("POST", _UNREGISTER, status, {"detail": "error"})
     assert common.unregister_agent_via_http(agent_session_name="antigravity-test") == (False, 0)

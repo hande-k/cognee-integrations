@@ -33,6 +33,7 @@ from _plugin_common import (
     read_connection_state,
     recall_via_http,
     record_slow_probe,
+    resolve_active_dataset_ids,
     resolve_runtime_mode,
     resolve_session_key_from_payload,
     same_connection_target,
@@ -375,6 +376,18 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
         is_code_scope = bool(code_lane) and scope_list == ["code"]
         scope_dataset = code_lane["dataset"] if is_code_scope else get_dataset(config)
         scope_code_query = code_lane["code_query"] if is_code_scope else None
+        # Shared memory addresses the session dataset by UUID: graph-only
+        # recall spans the canonical parent-owned copy plus any readable
+        # same-named ones, while a scope that includes session history stays
+        # bound to the ONE dataset the session writes to. The code dataset
+        # stays name-addressed — it is this repo's own dataset.
+        if is_code_scope:
+            scope_dataset_ids = []
+        else:
+            write_id, read_ids = resolve_active_dataset_ids()
+            scope_dataset_ids = (
+                read_ids if scope_list == ["graph"] else [write_id] if write_id else []
+            )
         part = None
         t0 = time.monotonic()
         try:
@@ -387,6 +400,7 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
                 search_type=qtype,
                 context_profile=context_profile,
                 dataset=scope_dataset,
+                dataset_ids=scope_dataset_ids,
                 code_query=scope_code_query,
                 timeout=scope_timeout,
             )
