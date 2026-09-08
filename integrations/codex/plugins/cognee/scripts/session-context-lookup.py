@@ -335,10 +335,17 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
     }
 
     # Hard time-box: this hook is on the keystroke->answer path, so recall must
-    # never be the long pole. Each scope gets a short per-call timeout, and the
-    # whole loop stops once the overall budget is spent. Partial results are fine.
-    recall_timeout = _float_env("COGNEE_RECALL_TIMEOUT", 2.5)
-    budget_deadline = time.monotonic() + _float_env("COGNEE_RECALL_BUDGET", 4.0)
+    # never be the long pole. Each scope gets a per-call timeout, and the whole
+    # loop stops once the overall budget is spent. Partial results are fine.
+    #
+    # Defaults (6s per scope, 8s overall) are sized for the graph scope, which
+    # runs last and is the only expensive call. Graph search time grows with
+    # the dataset, and a scope that overruns is recorded as zero hits, so a cap
+    # tuned for a small graph silently drops graph memory once the graph grows.
+    # The cheap scopes (session/trace/session_context/code) finish quickly, so
+    # nearly the whole budget is left for graph.
+    recall_timeout = _float_env("COGNEE_RECALL_TIMEOUT", 6.0)
+    budget_deadline = time.monotonic() + _float_env("COGNEE_RECALL_BUDGET", 8.0)
     # Respect the shared circuit breaker: when the server has been failing (tripped
     # by the explicit recall path), skip this per-prompt recall rather than hammering
     # a down backend on every keystroke.

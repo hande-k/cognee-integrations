@@ -79,11 +79,26 @@ const realSetImmediate = globalThis.setImmediate;
  * chain awaits real fs I/O (state loading, dataset-state save), which only
  * completes when the loop actually turns — a fixed number of fake advances
  * races a slow CI disk and flakes.
+ *
+ * One `readFile` alone is several libuv round trips (open/fstat/read/close),
+ * each needing its own poll phase, and the chain strings many such calls
+ * together — so a single setImmediate per step was not enough on a loaded CI
+ * runner and the loop ran out of steps before the chain reached unregister.
+ * Each step now yields `yieldsPerStep` real loop turns, and the step cap is
+ * generous: the loop exits as soon as `done()` holds, so the cap only matters
+ * when the chain is genuinely stuck, and fake-clock advances are cheap.
  */
-async function advanceUntil(done: () => boolean, maxSteps = 60, stepMs = 1_000): Promise<void> {
+async function advanceUntil(
+  done: () => boolean,
+  maxSteps = 300,
+  stepMs = 1_000,
+  yieldsPerStep = 10,
+): Promise<void> {
   for (let i = 0; i < maxSteps && !done(); i++) {
     await jest.advanceTimersByTimeAsync(stepMs);
-    await new Promise<void>((r) => realSetImmediate(r));
+    for (let j = 0; j < yieldsPerStep && !done(); j++) {
+      await new Promise<void>((r) => realSetImmediate(r));
+    }
   }
 }
 

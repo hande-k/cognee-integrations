@@ -10,6 +10,18 @@ is the cache key and semver record, bumped on each release, not the update trigg
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.2]
+
+### Changed
+- **Per-prompt recall waits long enough for growing graphs.** The defaults
+  for `COGNEE_RECALL_TIMEOUT` (per scope) and `COGNEE_RECALL_BUDGET` (whole
+  hook) go from 2.5s/4s to 6s/8s. Graph search time grows with the dataset,
+  and a scope that overruns its timeout is recorded as zero hits, so the old
+  caps could silently drop graph memory from recall once a graph got large.
+  Both values remain overridable via the environment or `~/.cognee/.env`. The
+  cheap scopes are unaffected, so a fast prompt is not slower; only a slow
+  graph query is now allowed to complete instead of being discarded.
+
 ## [1.6.1]
 
 ### Removed
