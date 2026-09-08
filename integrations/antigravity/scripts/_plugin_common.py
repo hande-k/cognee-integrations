@@ -2948,6 +2948,27 @@ def _json_http_request(
         return json.loads(body)
 
 
+_FALSE = {"0", "false", "no", "off"}
+
+
+def recall_node_sets(project_tags: list[str]) -> list[str]:
+    """Node sets the graph recall lane is scoped to, or [] for no scoping.
+
+    The project tags come from the session's pinned project memory state
+    (COGNEE_PROJECT_NODE_SET). COGNEE_RECALL_SHARED_NODE_SETS (comma-separated,
+    default "global") names the sets every project may read, and
+    COGNEE_RECALL_PROJECT_SCOPE=false keeps tagging without filtering recall.
+    """
+    tags = [str(t).strip() for t in project_tags if str(t).strip()]
+    if not tags:
+        return []
+    if os.environ.get("COGNEE_RECALL_PROJECT_SCOPE", "true").strip().lower() in _FALSE:
+        return []
+    shared = os.environ.get("COGNEE_RECALL_SHARED_NODE_SETS", "global")
+    extra = [t.strip() for t in shared.split(",") if t.strip()]
+    return list(dict.fromkeys(tags + extra))
+
+
 def _float_env(name: str, default: float) -> float:
     """Read a float from the environment, falling back to default on absence/parse error."""
     try:
@@ -3214,6 +3235,14 @@ def recall_via_http(
     target = route(dataset, session_id) if dataset and not code_query else {"write": dataset}
     if dataset:
         payload["datasets"] = [target["write"]]
+    # A session pinned to a project tag scopes its graph recall to that node set
+    # plus the shared sets (default "global"), OR-joined, so other projects'
+    # documents and sessions stop filling the graph lane. Session and trace
+    # scopes are keyed by session already and stay unfiltered.
+    node_name = recall_node_sets(target.get("node_set") or [])
+    if node_name and "graph" in scope:
+        payload["node_name"] = node_name
+        payload["node_name_filter_operator"] = "OR"
 
     def fetch_scopes():
         started = time.monotonic()
