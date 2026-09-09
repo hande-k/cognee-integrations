@@ -584,7 +584,20 @@ class GraphClient:
 
     @property
     def api_key(self) -> str:
-        """The principal key the plugin minted and cached in this temp HOME."""
+        """The principal key for this backend.
+
+        Cloud first: the tenant key comes in through ``COGNEE_LIVE_API_KEY`` and is
+        handed to the hooks as ``COGNEE_API_KEY``, which ``_resolve_single_principal_key``
+        honours *before* the cache — so on cloud the plugin never mints a key and
+        ``api_key.json`` is never written. Reading only the cache here left every
+        cloud recall keyless: the tenant answered 401 for the whole ``deadline``,
+        each graph assertion burned its full 15 minutes, and the job hit its
+        timeout with two tests reported. Locally the plugin mints against the
+        server it booted and caches the result, so the cache is the source there.
+        """
+        env_key = cloud_api_key()
+        if env_key:
+            return env_key
         cache = self.home / ".cognee-plugin" / "api_key.json"
         if not cache.exists():
             return ""
@@ -631,6 +644,19 @@ class GraphClient:
         while time.monotonic() < end:
             try:
                 last = self.recall(query)
+            except urllib.error.HTTPError as exc:
+                # 401/403 will not turn into a 200 by waiting: the key is wrong or
+                # missing. Retrying it for the full deadline is how a keyless client
+                # once spent 15 minutes per assertion and timed the whole job out.
+                # Anything else (404 before the dataset exists, 5xx while cognify
+                # is still running) is legitimately transient, so keep polling.
+                if exc.code in (401, 403):
+                    raise AssertionError(
+                        f"recall on {self.base_url} rejected the key (HTTP {exc.code}) "
+                        f"— api_key {'is empty' if not self.api_key else 'was supplied'}; "
+                        f"the graph cannot be verified with this credential"
+                    ) from exc
+                last = f"<recall error: HTTP {exc.code}: {exc.reason}>"
             except Exception as exc:  # server may be booting or briefly down
                 last = f"<recall error: {type(exc).__name__}: {exc}>"
             lowered = last.lower()
