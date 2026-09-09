@@ -176,7 +176,7 @@ def test_a_slow_cold_query_is_classified_slow_not_down(
     """Recall timeouts are tight on purpose; exceeding them is not an outage.
 
     With ``COGNEE_RECALL_TIMEOUT`` pinned to a tight 2.5s (the pre-1.5.1 default;
-    production now ships 6s/8s), the first graph query against a freshly booted
+    production now ships 10s/12s), the first graph query against a freshly booted
     server does not finish in time. The plugin must treat
     that as "slow" — no memory this prompt, no breaker trip, no failure state that
     would redden the status line — rather than concluding the server is down.

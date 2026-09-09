@@ -15,9 +15,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 - **Per-prompt recall waits long enough for growing graphs.** The defaults
   for `COGNEE_RECALL_TIMEOUT` (per scope) and `COGNEE_RECALL_BUDGET` (whole
-  hook) go from 2.5s/4s to 6s/8s. Graph search time grows with the dataset,
-  and a scope that overruns its timeout is recorded as zero hits, so the old
-  caps could silently drop graph memory from recall once a graph got large.
+  hook) go from 2.5s/4s to 10s/12s. Graph search time grows with the dataset
+  and with the round trip to a remote (cloud) server, and a scope that
+  overruns its timeout is recorded as zero hits, so the old caps could
+  silently drop graph memory from recall once a graph got large.
   Both values remain overridable via the environment or `~/.cognee/.env`. The
   cheap scopes are unaffected, so a fast prompt is not slower; only a slow
   graph query is now allowed to complete instead of being discarded.

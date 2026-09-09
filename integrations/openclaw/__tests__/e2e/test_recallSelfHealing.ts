@@ -216,7 +216,7 @@ describe("recall budget + circuit breaker", () => {
 
       const { api, emit } = createApi();
       const pending = emit("before_prompt_build", { prompt: "what did we discuss" }, { agentId: "will" });
-      await jest.advanceTimersByTimeAsync(8_500); // past the 8s default budget
+      await jest.advanceTimersByTimeAsync(12_500); // past the 12s default budget
       const results = await pending;
 
       expect(results.find((r) => r !== undefined)).toBeUndefined();
@@ -233,6 +233,6 @@ describe("recall budget + circuit breaker", () => {
     const { emit } = createApi();
     await emit("before_prompt_build", { prompt: "what did we discuss" }, { agentId: "will" });
 
-    expect(mockRecall).toHaveBeenCalledWith(expect.objectContaining({ timeoutMs: 6_000 }));
+    expect(mockRecall).toHaveBeenCalledWith(expect.objectContaining({ timeoutMs: 10_000 }));
   });
 });

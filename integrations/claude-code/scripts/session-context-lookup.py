@@ -303,15 +303,16 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
     # never be the long pole. Each scope gets a per-call timeout, and the whole
     # loop stops once the overall budget is spent. Partial results are fine.
     #
-    # Defaults (6s per scope, 8s overall) are sized for the graph scope, which
+    # Defaults (10s per scope, 12s overall) are sized for the graph scope, which
     # runs last and is the only expensive call. Graph search time grows with
-    # the dataset, and a scope that overruns is recorded as zero hits, so a cap
-    # tuned for a small graph silently drops graph memory once the graph grows.
+    # the dataset and with the round trip to a remote (cloud) server, and a
+    # scope that overruns is recorded as zero hits, so a cap tuned for a small
+    # local graph silently drops graph memory once either grows.
     # The cheap scopes (session/trace/session_context/code) finish quickly, so
     # nearly the whole budget is left for graph.
-    recall_timeout = _float_env("COGNEE_RECALL_TIMEOUT", 6.0)
+    recall_timeout = _float_env("COGNEE_RECALL_TIMEOUT", 10.0)
     recall_start = time.monotonic()
-    budget_deadline = recall_start + _float_env("COGNEE_RECALL_BUDGET", 8.0)
+    budget_deadline = recall_start + _float_env("COGNEE_RECALL_BUDGET", 12.0)
     # Respect the shared circuit breaker: when the server has been failing (tripped
     # by the explicit recall path), skip this per-prompt recall rather than hammering
     # a down backend on every keystroke.
