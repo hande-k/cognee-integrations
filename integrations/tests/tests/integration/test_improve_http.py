@@ -12,10 +12,9 @@ Contract:
     legacy full-document bridge that used to take over for 24h is gone;
   * an empty {} body means the per-session improve lock skipped the run — busy,
     never success;
-  * a dataset_id in the response triggers best-effort cognify+memify polling
-    (``has_improve_pipeline_polling`` is true for every shared suite — codex's
-    improve path was the one piece the background-remember port missed, and it
-    reported no cognify_status until that was fixed).
+  * suites without ``has_single_submit_improve``: a dataset_id in the response
+    triggers best-effort cognify+memify polling; single-submit suites never poll
+    after the submit (``wait_for_cognify`` is gone from them).
 
 Migrated from {claude-code,codex}/tests/test_improve_sync.py; the
 run_session_improve orchestration lives in unit/test_improve_orchestration.py.
@@ -53,7 +52,7 @@ def test_improve_posts_expected_json_payload(pc, mock_server):
 
 def test_submit_timeout_is_generous(pc, monkeypatch):
     """Distillation/agent-context run inside the request even in background
-    mode, so the submit timeout must stay generous (default 180s)."""
+    mode, so the submit timeout must stay generous."""
     timeouts = {}
     original = pc._json_http_request
 
@@ -83,7 +82,7 @@ def test_unsupported_statuses_return_not_ok_without_fallback(pc, mock_server, co
 
 @pytest.mark.parametrize("code", [404, 422])
 def test_run_session_improve_reports_unsupported_and_does_not_bridge(
-    pc, mock_server, monkeypatch, code
+    pc, suite, mock_server, monkeypatch, code
 ):
     """End to end through run_session_improve: the sync is reported as not done and
     the whole-transcript re-cognify that used to follow never happens."""
@@ -91,11 +90,19 @@ def test_run_session_improve_reports_unsupported_and_does_not_bridge(
     monkeypatch.setattr(pc, "drain_warmup_entries", lambda *a, **k: (0, 0))
     events = []
     monkeypatch.setattr(pc, "hook_log", lambda ev, detail=None: events.append((ev, detail or {})))
-    assert pc.run_session_improve("ds", "sid") is False
+    if suite.has_single_submit_improve:
+        assert pc.run_session_improve_detailed("ds", "sid")["ok"] is False
+    else:
+        assert pc.run_session_improve("ds", "sid") is False
     assert any(ev == "improve_unsupported" and d.get("status") == code for ev, d in events)
     assert not any(ev == "improve_unsupported_fallback" for ev, _ in events)
     mock_server.assert_not_called("POST", "/api/v1/remember")
-    assert pc.read_improve_state("sid") == {}
+    state = pc.read_improve_state("sid")
+    if suite.has_single_submit_improve:
+        # The failed attempt is on record (it arms the backoff); no success is.
+        assert "last_improved_at" not in state and state.get("last_failed_at")
+    else:
+        assert state == {}
 
 
 def test_server_error_is_not_unsupported(pc, mock_server):
@@ -125,6 +132,8 @@ def test_improve_lock_skip_reports_busy(pc, mock_server):
 
 def test_improve_polls_cognify_then_memify(pc, suite, mock_server):
     """A dataset_id in the response triggers both pipeline polls."""
+    if suite.has_single_submit_improve:
+        pytest.skip("single-submit suites have no post-improve status poll")
     res = pc.improve_session_via_http("ds", "sid")
     assert res["ok"] is True
     assert res["cognify_status"] == "completed"
@@ -132,7 +141,18 @@ def test_improve_polls_cognify_then_memify(pc, suite, mock_server):
 
     pipelines = [c["query"].get("pipeline") for c in mock_server.calls if c["path"] == STATUS]
     assert pipelines == ["cognify_pipeline", "memify_pipeline"]
-    assert suite.has_improve_pipeline_polling is True
+
+
+def test_no_status_poll_after_submit_on_single_submit_suites(pc, suite, mock_server):
+    """The poll was observability only, at one GET every 3s for up to ten minutes
+    per improve; it is gone along with the poller itself."""
+    if not suite.has_single_submit_improve:
+        pytest.skip("suite still polls after the submit")
+    res = pc.improve_session_via_http("ds", "sid")
+    assert res["ok"] is True
+    assert "cognify_status" not in res and "memify_status" not in res
+    mock_server.assert_not_called("GET", STATUS)
+    assert not hasattr(pc, "wait_for_cognify")
 
 
 def test_no_polling_when_response_has_no_dataset_id(pc, mock_server):

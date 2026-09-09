@@ -35,8 +35,6 @@ from utils.recall import drive_recall
 
 @pytest.fixture
 def pc(suite, isolated_modules):
-    if not suite.has_elapsed_ms_helper:
-        pytest.skip(f"{suite.name}: no elapsed_ms helper (scopes are timed inline instead)")
     return isolated_modules(suite, "_plugin_common")
 
 

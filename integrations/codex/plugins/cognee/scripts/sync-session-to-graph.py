@@ -28,7 +28,7 @@ from _plugin_common import (
     load_resolved,
     resolve_session_key_from_payload,
     resolved_http_endpoint_auth,
-    run_session_improve,
+    run_session_improve_detailed,
     set_session_key,
     unregister_agent_via_http,
 )
@@ -323,12 +323,20 @@ async def _sync(
 
         incomplete: list[str] = []
         # The final (strict) sync must always run; a manual /cognee-sync too.
-        # Only the idle and auto triggers honour the improve cooldown. The server
-        # serializes improves per session itself, so no cross-hook lock is taken.
+        # Only the idle and auto triggers honour the improve cooldown/backoff.
         trigger = "final" if strict else "manual"
         for sid, ds in targets:
-            wrote = run_session_improve(ds, sid, trigger=trigger)
-            if not wrote:
+            outcome = run_session_improve_detailed(ds, sid, trigger=trigger)
+            wrote = bool(outcome.get("ok"))
+            why = str(outcome.get("reason") or "")
+            if why == "busy":
+                # Another improve of this session is in flight server-side (the
+                # idle watcher's, or a second final worker). It persists
+                # everything above the session watermark, and re-submitting
+                # would only be recorded as one more improve operation — so a
+                # busy answer is deferred, never retried.
+                hook_log("sync_bridge_deferred_busy", {"session": sid, "dataset": ds})
+            elif not wrote:
                 incomplete.append(f"{ds}:{sid}")
             hook_log(
                 "sync_bridge_done",
@@ -337,17 +345,21 @@ async def _sync(
                     "dataset": ds,
                     "via": "http_improve",
                     "wrote": wrote,
+                    "reason": why,
+                    "error": str(outcome.get("error") or "")[:120],
                 },
             )
             print(
-                f"cognee-sync: dataset={ds} session={sid} via=http_improve wrote={wrote}",
+                f"cognee-sync: dataset={ds} session={sid} via=http_improve wrote={wrote}"
+                + (f" reason={why}" if why else ""),
                 file=sys.stderr,
             )
         if strict and incomplete:
             # The detached final worker retries on exceptions only. This is the
-            # session's LAST sync — an incomplete one (failed improve or
-            # undelivered warmup entries) must re-drive the whole drain+improve,
-            # not silently report success.
+            # session's LAST sync — an incomplete one (transport failure, timed
+            # out submit, undelivered warmup entries) must re-drive the whole
+            # drain+improve, not silently report success. A busy answer is not
+            # in this list on purpose.
             raise RuntimeError(f"final session sync incomplete for: {', '.join(incomplete)}")
     finally:
         if unregister_on_finish:

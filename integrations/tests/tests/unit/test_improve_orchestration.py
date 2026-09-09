@@ -1,12 +1,17 @@
-"""Orchestration around the improve bridge (_plugin_common.run_session_improve).
+"""Orchestration around the improve bridge (_plugin_common.run_session_improve /
+run_session_improve_detailed on single-submit suites).
 
 These stay at the seam: what is under test is the decision sequence — drain the
-warmup buffer, improve, retry while the per-session improve lock is busy, report
-failure when entries were left undelivered, and record the session's improve
-state on success. There is deliberately no fallback any more: a server without
-session-aware improve is reported as not synced, never bridged by re-posting the
-whole transcript. The wire-level submit is covered in
+warmup buffer, improve, report failure when entries were left undelivered, and
+record the session's improve state. There is deliberately no fallback any more: a
+server without session-aware improve is reported as not synced, never bridged by
+re-posting the whole transcript. The wire-level submit is covered in
 integration/test_improve_http.py.
+
+Busy handling differs by suite. Suites without ``has_single_submit_improve``
+re-submit a busy answer until the server's per-session lock frees (the tests
+at the bottom). Suites with it never do — that contract, plus the failure
+backoff it records, lives in unit/test_improve_single_submit.py.
 
 Migrated from {claude-code,codex}/tests/test_improve_sync.py.
 """
@@ -22,7 +27,17 @@ import pytest
 def pc(suite, isolated_modules, monkeypatch):
     common = isolated_modules(suite, "_plugin_common")
     monkeypatch.setattr(common, "hook_log", lambda *a, **k: None)
+    monkeypatch.setattr(
+        common, "_suite_single_submit", suite.has_single_submit_improve, raising=False
+    )
     return common
+
+
+def _run_bool(pc, dataset, session_id, **kwargs) -> bool:
+    """The boolean view of a sync across suite generations."""
+    if hasattr(pc, "run_session_improve_detailed"):
+        return bool(pc.run_session_improve_detailed(dataset, session_id, **kwargs)["ok"])
+    return pc.run_session_improve(dataset, session_id, **kwargs)
 
 
 @pytest.fixture
@@ -52,7 +67,7 @@ def run_improve(pc, monkeypatch):
         monkeypatch.setattr(pc, "_DRAIN_RETRY_PAUSE_SECONDS", 0.0)
 
         kwargs = {} if trigger is None else {"trigger": trigger}
-        return pc.run_session_improve("ds", "sid", **kwargs), calls
+        return _run_bool(pc, "ds", "sid", **kwargs), calls
 
     return _run
 
@@ -71,13 +86,25 @@ def test_unsupported_response_returns_false_without_sync(run_improve, pc):
     assert calls["improve"] == 1
     assert not hasattr(pc, "persist_session_cache_to_graph_via_http")
     assert not hasattr(pc, "improve_unsupported")
-    assert pc.read_improve_state("sid") == {}  # nothing succeeded, nothing recorded
+    _assert_no_success_recorded(pc, suite_flag=pc._suite_single_submit)
 
 
 def test_error_returns_false(run_improve, pc):
     wrote, _calls = run_improve({"ok": False, "status": 500, "error": "boom"})
     assert wrote is False
-    assert pc.read_improve_state("sid") == {}
+    _assert_no_success_recorded(pc, suite_flag=pc._suite_single_submit)
+
+
+def _assert_no_success_recorded(pc, *, suite_flag: bool) -> None:
+    """Nothing succeeded, so no success is on record. Single-submit suites do
+    record the *failure* (that is what arms the backoff); the others record
+    nothing at all."""
+    state = pc.read_improve_state("sid")
+    if suite_flag:
+        assert "last_improved_at" not in state
+        assert state.get("last_failed_at")
+    else:
+        assert state == {}
 
 
 def test_success_records_improve_state(run_improve, pc):
@@ -110,9 +137,11 @@ def test_final_trigger_ignores_cooldown(run_improve, pc):
     assert calls["improve"] == 1
 
 
-def test_retries_busy_until_lock_frees(run_improve, monkeypatch):
+def test_retries_busy_until_lock_frees(run_improve, suite, monkeypatch):
     # A lock-skipped improve may have snapshotted the cache before the latest
     # turns — run_session_improve must re-submit until a run actually lands.
+    if suite.has_single_submit_improve:
+        pytest.skip("single-submit suites never re-submit a busy answer")
     monkeypatch.setenv("COGNEE_IMPROVE_BUSY_RETRY_INTERVAL", "0.1")
     wrote, calls = run_improve(
         None,
@@ -122,7 +151,9 @@ def test_retries_busy_until_lock_frees(run_improve, monkeypatch):
     assert calls["improve"] == 3
 
 
-def test_busy_deadline_gives_up(run_improve, monkeypatch):
+def test_busy_deadline_gives_up(run_improve, suite, monkeypatch):
+    if suite.has_single_submit_improve:
+        pytest.skip("single-submit suites never re-submit a busy answer")
     monkeypatch.setenv("COGNEE_IMPROVE_BUSY_RETRY_INTERVAL", "0.1")
     monkeypatch.setenv("COGNEE_IMPROVE_BUSY_DEADLINE", "0.25")
     wrote, calls = run_improve({"ok": False, "busy": True})

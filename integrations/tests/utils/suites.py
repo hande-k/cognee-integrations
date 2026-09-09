@@ -55,37 +55,14 @@ class Suite:
     #: the two happen to share a value, but one names a process and the other a
     #: session, and nothing keeps them equal.
     host_stem: str
-    #: Capability: has the background-remember + cognify-poll refactor. Submits
-    #: writes with run_in_background=true, exposes _plugin_common.wait_for_cognify,
-    #: and honours the bounded wait in _remember_http. The improve path has its
-    #: own flag below — that part of the refactor did not travel with the rest.
-    #: (The legacy document bridge that first carried this contract is gone.)
-    #:
-    #: True for all registered suites as of the port that landed in main: codex previously
-    #: had the older synchronous, raise-on-error path. Kept as a flag rather than
-    #: deleted because it names a real contract that a future integration may not
-    #: satisfy.
-    has_background_remember: bool
-    #: Capability: ``improve_session_via_http`` polls the cognify and memify
-    #: pipelines and reports ``cognify_status``/``memify_status``.
-    #:
-    #: True for all registered suites now. It was split out from has_background_remember
-    #: because the port that landed in main covered the bridge, ``wait_for_cognify``
-    #: and the bounded ``do_remember`` wait but missed the improve path; kept as its
-    #: own flag because those parts demonstrably travel separately.
-    has_improve_pipeline_polling: bool
     #: Capability: the host runs ``async`` hooks and emits ``StopFailure``, so
     #: credits can refresh at turn end without adding a prompt of lag. codex skips
     #: async hooks entirely and has no StopFailure, so its entry must be a plain
     #: sync Stop hook with a tight timeout.
     has_async_hooks: bool
-    #: Capability: exposes the shared ``_plugin_common.elapsed_ms`` helper (#3676)
-    #: and logs it on the remember/improve events.
-    has_elapsed_ms_helper: bool
     #: Capability: logs an *aggregate* ``elapsed_ms`` on the ``context_lookup_*``
-    #: events. Split from the helper flag because codex now has the helper but
-    #: still times only each recall scope inline — so ``per_scope[*]["elapsed_ms"]``
-    #: is present on all registered suites while the per-prompt total is claude-code only.
+    #: events. ``per_scope[*]["elapsed_ms"]`` is present on all registered suites
+    #: while the per-prompt total is claude-code only.
     has_recall_latency_metric: bool
     #: Capability: renders a rich terminal status bar — the health glyphs, the
     #: recall-counts diagnostics strip, the mode word and the plugin-install
@@ -107,6 +84,16 @@ class Suite:
     #: does not get there. Closing this needs a server-side way to read recent
     #: session entries without a query, not more client-side branching.
     has_precompact_http: bool
+    #: Capability (SDK-594): one improve submit per trigger. The improve path takes
+    #: no machine-wide per-session lock, never re-submits a busy answer, has no
+    #: post-submit pipeline-status poll (``wait_for_cognify`` is gone), records
+    #: failed attempts so the idle/auto cooldown arms as a ``backoff``, exposes
+    #: ``run_session_improve_detailed`` -> ``{"ok", "reason", "error"}`` in place
+    #: of the boolean ``run_session_improve``, the final sync defers a busy answer
+    #: instead of retrying it, and the idle watcher exits after one attempt and
+    #: runs no "shutdown" improve when stopped. Antigravity still carries the
+    #: lock, the 15s busy loop, the poll and the shutdown flush.
+    has_single_submit_improve: bool
 
 
 CLAUDE = Suite(
@@ -122,13 +109,11 @@ CLAUDE = Suite(
     cwd_env="CLAUDE_CWD",
     session_suffix="_claude",
     host_stem="claude",
-    has_background_remember=True,
-    has_improve_pipeline_polling=True,
     has_async_hooks=True,
-    has_elapsed_ms_helper=True,
     has_recall_latency_metric=True,
     has_rich_statusline=True,
     has_precompact_http=False,
+    has_single_submit_improve=True,
 )
 
 CODEX = Suite(
@@ -149,13 +134,11 @@ CODEX = Suite(
     cwd_env="CODEX_CWD",
     session_suffix="_codex",
     host_stem="codex",
-    has_background_remember=True,
-    has_improve_pipeline_polling=True,
     has_async_hooks=False,
-    has_elapsed_ms_helper=True,
     has_recall_latency_metric=False,
     has_rich_statusline=False,
     has_precompact_http=True,
+    has_single_submit_improve=True,
 )
 
 ANTIGRAVITY = Suite(
@@ -170,14 +153,12 @@ ANTIGRAVITY = Suite(
     cwd_env="AGY_CWD",
     session_suffix="_agy",
     host_stem="agy",
-    has_background_remember=True,
-    has_improve_pipeline_polling=True,
     has_async_hooks=False,
-    has_elapsed_ms_helper=True,
     has_recall_latency_metric=False,
     has_rich_statusline=False,
     has_precompact_http=True,
     hook_manifest_style="named",
+    has_single_submit_improve=False,
 )
 
 ALL_SUITES = [CLAUDE, CODEX, ANTIGRAVITY]

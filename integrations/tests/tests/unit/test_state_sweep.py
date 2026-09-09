@@ -5,9 +5,11 @@ Every launch leaves a file in half a dozen directories and nothing removed them
 sessions that are provably over, and only that: age alone for the status
 markers and per-session caches a live session keeps rewriting, pid death plus a
 grace period for launch records the exit-watcher still reads after the host
-exits, dead-pid for improve locks, age for the per-session improve state the
-cooldown reads. It also rotates oversized logs that predate the cap or are only ever
-written by a child process, and removes directories older versions left behind.
+exits, dead-pid for improve locks (suites that still have them), age for the
+per-session improve state the cooldown reads. It also rotates oversized logs that
+predate the cap or are only ever written by a child process, and removes
+directories older versions left behind (on ``has_single_submit_improve`` suites
+that includes the retired ``improve-locks/`` dir itself).
 """
 
 from __future__ import annotations
@@ -99,7 +101,9 @@ def test_launch_record_without_pid_is_kept_until_thirty_days(pc):
 # ── improve locks ──────────────────────────────────────────────────────────
 
 
-def test_dead_pid_and_overaged_improve_locks_are_cleared_live_ones_kept(pc):
+def test_dead_pid_and_overaged_improve_locks_are_cleared_live_ones_kept(pc, suite):
+    if suite.has_single_submit_improve:
+        pytest.skip("suite has no improve locks; the dir is swept as legacy instead")
     now = time.time()
     dead = _write(
         pc._IMPROVE_LOCK_DIR / "dead.lock",
@@ -126,6 +130,18 @@ def test_dead_pid_and_overaged_improve_locks_are_cleared_live_ones_kept(pc):
     assert not dead.exists() and not old.exists() and not garbage.exists()
     assert live.exists()
     assert counts["improve_locks"] == 3
+
+
+def test_retired_improve_locks_dir_is_removed_as_legacy(pc, suite):
+    if not suite.has_single_submit_improve:
+        pytest.skip("suite still uses improve-locks/")
+    legacy = pc._PLUGIN_DIR / "improve-locks"
+    _write(legacy / "leftover.lock", {"owner": "run_session_improve", "pid": 1}, 60)
+    counts = pc.sweep_stale_state()
+    assert not legacy.exists()
+    assert counts["legacy_dirs"] >= 1
+    assert "improve_locks" not in counts
+    assert not hasattr(pc, "_sweep_improve_locks")
 
 
 # ── per-session improve state (cooldown) ───────────────────────────────────

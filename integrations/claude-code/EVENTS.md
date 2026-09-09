@@ -118,14 +118,8 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `hook:idle_watcher_kill_failed` | `idle.watcher_kill_failed` |
 | `hook:idle_watcher_restart_failed` | `idle.watcher_restart_failed` |
 | `hook:idle_watcher_restarted` | `idle.watcher_restarted` |
-| `hook:improve_busy_retry` | `improve.busy_retry` |
 | `hook:improve_fired` | `improve.fired` |
 | `hook:improve_incomplete_drain` | `improve.incomplete_drain` |
-| `hook:improve_lock_failed_open` | `improve.lock_failed_open` |
-| `hook:improve_lock_release_failed` | `improve.lock_release_failed` |
-| `hook:improve_lock_stale_cleared` | `improve.lock_stale_cleared` |
-| `hook:improve_lock_unlink_failed` | `improve.lock_unlink_failed` |
-| `hook:improve_skipped_concurrent` | `improve.skipped_concurrent` |
 | `hook:improve_state_write_failed` | `improve.state_write_failed` |
 | `hook:improve_unsupported` | `improve.unsupported` |
 | `hook:invalid_payload_json` | `io.payload_json` |
@@ -233,6 +227,7 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `hook:switch_watcher_restart_failed` | `switch.watcher_restart_failed` |
 | `hook:switch_watcher_restarted` | `switch.watcher_restarted` |
 | `hook:switch_watcher_stop_failed` | `switch.watcher_stop_failed` |
+| `hook:sync_bridge_deferred_busy` | `sync.bridge_deferred_busy` |
 | `hook:sync_bridge_done` | `sync.bridge_done` |
 | `hook:sync_deferred_to_shutdown_worker` | `sync.deferred_to_shutdown_worker` |
 | `hook:sync_detach_failed` | `sync.detach_failed` |
@@ -275,7 +270,7 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `hook:watcher_stop_unlink_failed` | `watcher.stop_unlink_failed` |
 | `hook:watcher_stop_write_failed` | `watcher.stop_write_failed` |
 | `idle-watcher:activity_read_failed` | `idle_watcher.activity_read_failed` |
-| `idle-watcher:bridge_disabled_after_failure` | `idle_watcher.bridge_disabled_after_failure` |
+| `idle-watcher:bridge_failed` | `idle_watcher.bridge_failed` |
 | `idle-watcher:bridge_done` | `idle_watcher.bridge_done` |
 | `idle-watcher:bridge_error` | `idle_watcher.bridge_error` |
 | `idle-watcher:bridge_skipped_no_auth` | `idle_watcher.bridge_skipped_no_auth` |
@@ -301,9 +296,6 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `idle-watcher:session_bridge_done` | `idle_watcher.session_bridge_done` |
 | `idle-watcher:shared_memory_refresh_failed` | `idle_watcher.shared_memory_refresh_failed` |
 | `idle-watcher:shared_memory_refreshed` | `idle_watcher.shared_memory_refreshed` |
-| `idle-watcher:shutdown_bridge_done` | `idle_watcher.shutdown_bridge_done` |
-| `idle-watcher:shutdown_bridge_failed` | `idle_watcher.shutdown_bridge_failed` |
-| `idle-watcher:shutdown_trigger` | `idle_watcher.shutdown_trigger` |
 | `idle-watcher:signal_received` | `idle_watcher.signal_received` |
 | `idle-watcher:started` | `idle_watcher.started` |
 | `idle-watcher:stop_sentinel_seen` | `idle_watcher.stop_sentinel_seen` |

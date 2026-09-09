@@ -296,16 +296,15 @@ An idle watcher runs in the background for the lifetime of each launch. It polls
 
 Both of those automatic triggers share one **per-session cooldown**: after any successful improve of a session (idle, auto, manual or final), no further idle/auto improve runs for `COGNEE_IMPROVE_COOLDOWN` seconds, and none runs at all until at least one new prompt, tool call or answer has been stored since. The timestamp and turn count are persisted per session under `~/.cognee-plugin/claude-code/improve-state/`, so they survive the watcher process, which exits after each bridge and is respawned on the next prompt. (Until 1.4.4 the cooldown lived only in that process's memory and was reset on every respawn, so in practice an improve ran after every prompt.) The session-end final sync, the `/cognee-memory:cognee-sync` skill and the dataset-switch sync ignore the cooldown and always run.
 
+A **failed** attempt arms the same window as a **backoff**: if the submit timed out, the server was unreachable, or the server answered *busy* (its per-session improve lock is held by another run), no automatic improve of that session runs again until `COGNEE_IMPROVE_COOLDOWN` seconds have passed. A busy answer is never retried by the plugin — the in-flight improve persists everything above the session's server-side watermark, and the next trigger covers whatever landed after it. (Until 1.5.3 only a success armed the cooldown, the plugin held its own per-session lock, and a busy answer was re-submitted every 15 seconds for up to ten minutes, each re-submit counted by the server as one more improve.)
+
 | Env var | Default | Effect |
 |---|---|---|
 | `COGNEE_IDLE_POLL` | `10` | Poll interval in seconds |
 | `COGNEE_IDLE_THRESHOLD` | `60` | Seconds of inactivity before idle improve fires |
 | `COGNEE_IMPROVE_COOLDOWN` | `600` | Minimum seconds between automatic (idle/auto) improves of one session; persisted per session |
 | `COGNEE_AUTO_IMPROVE_EVERY` | `150` | Stored tool calls/stops between automatic improves (`0` disables) |
-| `COGNEE_IMPROVE_SUBMIT_TIMEOUT` | `180` | Read timeout for the improve POST (distillation runs inside the request) |
-| `COGNEE_IMPROVE_POLL_DEADLINE` | `600` | Best-effort wait for cognify/memify completion after submit |
-| `COGNEE_IMPROVE_BUSY_DEADLINE` | `600` | How long to wait for a concurrent improve's session lock before giving up |
-| `COGNEE_IMPROVE_BUSY_RETRY_INTERVAL` | `15` | Seconds between re-submits while the session lock is held |
+| `COGNEE_IMPROVE_SUBMIT_TIMEOUT` | `420` | Read timeout for the improve POST (agent-context extraction and distillation run inside the request) |
 
 Final sync on session end is triggered by the `SessionEnd` detached worker, with an exit watcher as fallback if the process exits without firing `SessionEnd`.
 
@@ -546,8 +545,8 @@ where a boot that failed before the server could open its own log explains itsel
 At every SessionStart the plugin also sweeps its own state directory: per-session
 files whose session is over (status markers, bridge caches and pending buffers
 untouched for a week; launch records a week after their host process died, or
-after 30 days), improve locks whose owner is gone, improve-state files
-untouched for a week, and directories older versions left behind. It
+after 30 days), improve-state files untouched for a week, and files and
+directories older versions left behind (such as `improve-locks/`). It
 never touches another plugin's subdirectory. One `state_sweep` line in
 `hook.log` records what was removed.
 
@@ -733,8 +732,7 @@ Keys are letters, digits, and underscores. Values are taken literally — no `$V
 | idle watcher threshold | `COGNEE_IDLE_THRESHOLD` | `60` | Seconds of inactivity before idle improve fires |
 | improve cooldown | `COGNEE_IMPROVE_COOLDOWN` | `600` | Minimum seconds between automatic (idle/auto) improves of one session |
 | auto-improve threshold | `COGNEE_AUTO_IMPROVE_EVERY` | `150` | Stored tool calls/stops between automatic improves (`0` disables) |
-| improve submit timeout | `COGNEE_IMPROVE_SUBMIT_TIMEOUT` | `180` | Read timeout for the improve POST |
-| improve poll deadline | `COGNEE_IMPROVE_POLL_DEADLINE` | `600` | Best-effort wait for pipeline completion after submit |
+| improve submit timeout | `COGNEE_IMPROVE_SUBMIT_TIMEOUT` | `420` | Read timeout for the improve POST |
 
 ### Automatic capture controls
 
