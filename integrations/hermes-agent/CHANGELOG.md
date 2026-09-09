@@ -10,6 +10,19 @@ The version must match the `version` field in both `pyproject.toml` and
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.2.2]
+
+### Changed
+- **The per-prompt recall prefetch dispatches every lane at once.** The layered
+  lanes (`session`, `trace`, `session_context`, `graph`, plus `code` when armed)
+  ran one after another, cheap lanes first, so every cheap lane was a full round
+  trip on top of the graph search and an armed code lane could burn seconds
+  before graph even started. All lanes are now in flight together under one
+  shared deadline — `recall_timeout` clamped to `recall_budget` — and the
+  prefetch costs the slowest lane, not the sum. The rendered blocks keep their
+  canonical order whichever lane answers first; a failing lane still never
+  discards the others, and the breaker still sees one verdict per turn.
+
 ## [1.2.1]
 
 Fixes [#382](https://github.com/topoteretes/cognee-integrations/issues/382):

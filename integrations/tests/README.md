@@ -60,15 +60,17 @@ Divergences are named by a declared flag on `Suite`, never inferred from
 | Flag | `claude-code` | `codex` | `antigravity` | Gates |
 |---|---|---|---|---|
 | `has_async_hooks` | `True` | `False` | `False` | `async` hook entries + `StopFailure` in `hooks.json` |
-| `has_recall_latency_metric` | `True` | `False` | `False` | aggregate `elapsed_ms` on `context_lookup_*` |
 | `has_rich_statusline` | `True` | `False` | `False` | health glyphs, recall-counts strip, mode word, install registry |
 | `has_precompact_http` | `False` | `True` | `True` | `pre-compact.py` recalls over HTTP |
 | `has_single_submit_improve` | `True` | `True` | `False` | one improve submit per trigger (SDK-594): no plugin-side improve lock, no busy re-submit, no post-improve status poll, failure backoff, `run_session_improve_detailed`, no shutdown improve in the idle watcher |
 | `host_stem` | `claude` | `codex` | `agy` | `_proc`'s Windows ancestry match |
+| `has_local_sdk_recall` | `False` | `False` | `True` | `session-context-lookup.py` keeps an in-process `cognee.recall` branch next to HTTP; its concurrent fan-out is driven in both modes |
 
 A flag is retired once every registered suite agrees on it. `has_background_remember`,
 `has_improve_pipeline_polling` and `has_elapsed_ms_helper` were all `True` everywhere
-and gated nothing, so they are gone; `has_single_submit_improve` goes the same way
+and gated nothing, so they are gone; `has_recall_latency_metric` followed when codex
+and antigravity gained the aggregate `elapsed_ms` alongside the concurrent recall
+fan-out (per-scope timings overlap now, so the total is no longer their sum); `has_single_submit_improve` goes the same way
 once Antigravity is ported.
 
 Two lessons from the `has_background_remember` flip that made codex pass 39 tests
@@ -217,8 +219,9 @@ Non-obvious rules this tier encodes (each one learned by getting it wrong —
   "poll recall until the content comes back".
 - **The venv is seeded** from the host's `~/.cognee-plugin/venv` so boot is ~15s
   instead of a multi-minute `uv` install. That caches the *install* only.
-- **Recall timeouts are raised** (`COGNEE_RECALL_TIMEOUT`/`_BUDGET`). Production
-  keeps them tight (10s/12s) so memory can never stall an interactive prompt, and
+- **Recall deadlines are raised** (`COGNEE_RECALL_BUDGET` for the per-prompt hook,
+  `COGNEE_RECALL_TIMEOUT` for the explicit search path). Production
+  keeps them tight (12s per prompt) so memory can never stall an interactive prompt, and
   a cold server's first graph query correctly exceeds that. These tests ask
   whether memory crosses sessions, not whether cold-start recall is fast — so
   cold-start deserves its own scenario rather than silently failing this one.

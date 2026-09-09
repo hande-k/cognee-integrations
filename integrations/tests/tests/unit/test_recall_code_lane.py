@@ -21,9 +21,7 @@ in integration/test_code_graph.py.
 from __future__ import annotations
 
 import pytest
-from utils.recall import drive_recall
-
-STANDARD = ["session", "trace", "session_context", "graph"]
+from utils.recall import SCOPES, drive_recall
 
 
 def _header(output) -> str:
@@ -67,14 +65,14 @@ def test_conversational_prompt_dispatches_only_standard_scopes(lookup, monkeypat
     run = drive_recall(
         lookup, monkeypatch, prompt="thanks, that looks right", cwd=str(indexed_repo)
     )
-    assert run.calls == STANDARD
+    assert sorted(run.calls) == sorted(SCOPES)  # concurrent dispatch: order is not meaningful
     assert not run.fired("code_lane_armed")
 
 
 def test_identifier_outside_an_indexed_repo_does_not_arm(lookup, monkeypatch, tmp_path):
     """No opt-in for this checkout — the lane must not query someone else's graph."""
     run = drive_recall(lookup, monkeypatch, prompt="what calls process_payment?", cwd=str(tmp_path))
-    assert run.calls == STANDARD
+    assert sorted(run.calls) == sorted(SCOPES)  # concurrent dispatch: order is not meaningful
 
 
 def test_header_shape_is_unchanged_when_the_lane_is_off(suite, lookup, monkeypatch):
@@ -109,10 +107,10 @@ def test_identifier_in_an_indexed_repo_adds_the_lane(lookup, monkeypatch, indexe
         cwd=str(indexed_repo / "src"),
     )
     assert "code" in run.calls
-    # Additive: every semantic scope still ran, and the code lane precedes the
-    # graph long pole so a warm snapshot answers before the budget is spent.
-    assert [c for c in run.calls if c != "code"] == STANDARD
-    assert run.calls.index("code") < run.calls.index("graph")
+    # Additive: every semantic scope still ran alongside it. The scopes are
+    # dispatched concurrently, so only membership is meaningful, not order.
+    assert sorted(c for c in run.calls if c != "code") == sorted(SCOPES)
+    assert run.calls.count("code") == 1
 
     armed = run.detail("code_lane_armed")
     assert armed["identifier"] == "process_payment"
@@ -132,7 +130,7 @@ def test_lane_carries_the_repo_dataset_and_structured_query(lookup, monkeypatch,
 def test_semantic_scopes_keep_the_session_dataset(lookup, monkeypatch, indexed_repo):
     """The code lane's dataset override must not leak into the other scopes."""
     run = drive_recall(lookup, monkeypatch, prompt="explain UserService", cwd=str(indexed_repo))
-    for scope in STANDARD:
+    for scope in SCOPES:
         assert run.kwargs[scope].get("dataset") != "codebase-proj"
         assert run.kwargs[scope].get("code_query") is None
 
@@ -194,6 +192,6 @@ def test_a_broken_gate_never_breaks_the_prompt(lookup, monkeypatch, indexed_repo
         cwd=str(indexed_repo),
         recall={"session": [{"question": "q", "answer": "a"}]},
     )
-    assert run.calls == STANDARD
+    assert sorted(run.calls) == sorted(SCOPES)  # concurrent dispatch: order is not meaningful
     assert run.fired("code_lane_gate_error")
     assert "q" in run.output["hookSpecificOutput"]["additionalContext"]
