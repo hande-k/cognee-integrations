@@ -132,9 +132,13 @@ jobs:
     name: live tier (cloud tenant)
     runs-on: ubuntu-latest
     continue-on-error: false
-    # No venv to build and no server to boot, so this is the fast half: the hooks
-    # talk to the tenant over stdlib HTTP and never import cognee.
-    timeout-minutes: 45
+    # No venv to build and no server to boot, but NOT the fast half: the scenarios
+    # are the same 40-odd graph round trips as the local job, and each cognify
+    # runs on the shared tenant rather than a warm local server. The first full
+    # run took 50 minutes; at 45 the job was cut off with two tests reported and
+    # no tracebacks (pytest holds failure output until the session ends). Sized
+    # with headroom for a slow tenant night rather than to the median.
+    timeout-minutes: 100
     # Independent of the local job on purpose: a cloud outage should not hide a
     # local regression, and vice versa. Both still serialise via `concurrency`.
     outputs:
@@ -220,7 +224,7 @@ jobs:
 
   # hermes-agent boots its own cognee server and drives the plugin's provider
   # API directly — no hooks, no temp HOME, no plugin venv to seed. So this job
-  # shares the tier's shape (nightly, real LLM, Slack on failure) but none of the
+  # shares the tier's shape (nightly, real LLM, Slack report) but none of the
   # other two's setup: its own package dir, its own pytest invocation, and the
   # opt-in gate its tests already ship with (COGNEE_RUN_INTEGRATION).
   hermes:
@@ -422,13 +426,15 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   notify:
-    name: Slack failure report
+    name: Slack nightly report
     runs-on: ubuntu-latest
     needs: [local, cloud, hermes, openclaw]
-    # Failure-only by design: silence means green. `always()` is required for
-    # the condition to be evaluated at all — without it a failed dependency
-    # skips this job before the contains() is ever read.
-    if: always() && contains(needs.*.result, 'failure')
+    # Reports every run, green included. This tier used to be failure-only
+    # ("silence means green"), which made a broken notifier and a passing night
+    # indistinguishable — and after weeks of red, a green run is the news. The
+    # message carries each tier's result either way. `always()` is required for
+    # the job to run at all when a dependency failed or was cancelled.
+    if: always()
     steps:
       # Secrets, both already-or-easily provisioned:
       #   SLACK_BOT_TOKEN     — the same bot ci.yml uses for PR-review DMs,
@@ -441,7 +447,7 @@ jobs:
       #     ID (C…) if a channel is ever preferred (invite the bot to it).
       #     Kept in a secret rather than in this public file so the address is
       #     not scrapable.
-      - name: DM the nightly failure summary
+      - name: DM the nightly summary
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_NIGHTLY_NOTIFY: ${{ secrets.SLACK_NIGHTLY_NOTIFY }}
@@ -466,7 +472,7 @@ jobs:
           token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
           target = os.environ.get("SLACK_NIGHTLY_NOTIFY", "").strip()
           if not token or not target:
-              print("::error::SLACK_BOT_TOKEN / SLACK_NIGHTLY_NOTIFY are not set — cannot send the failure DM.")
+              print("::error::SLACK_BOT_TOKEN / SLACK_NIGHTLY_NOTIFY are not set — cannot send the nightly DM.")
               sys.exit(1)
 
           def slack(method: str, params: dict) -> dict:
@@ -502,26 +508,47 @@ jobs:
           # would additionally require im:write). Channel IDs post as-is.
           channel = target
 
+          results = {
+              "local tier": (os.environ.get("LOCAL_RESULT", ""), os.environ.get("LOCAL_FAILED", "")),
+              "cloud tier": (os.environ.get("CLOUD_RESULT", ""), os.environ.get("CLOUD_FAILED", "")),
+              "hermes tier": (os.environ.get("HERMES_RESULT", ""), os.environ.get("HERMES_FAILED", "")),
+              "openclaw tier": (os.environ.get("OPENCLAW_RESULT", ""), os.environ.get("OPENCLAW_FAILED", "")),
+          }
+
           def tier(name: str, result: str, failed: str) -> str:
-              icon = {"success": ":white_check_mark:", "failure": ":red_circle:"}.get(result, ":white_circle:")
-              lines = [f"{icon} *{name}*: {result}"]
+              icon = {
+                  "success": ":white_check_mark:",
+                  "failure": ":red_circle:",
+                  "cancelled": ":octagonal_sign:",
+                  "skipped": ":fast_forward:",
+              }.get(result, ":white_circle:")
+              lines = [f"{icon} *{name}*: {result or 'unknown'}"]
               if result == "failure":
                   tests = [t for t in failed.splitlines() if t.strip()]
                   lines += [f"> `{t}`" for t in tests]
                   if not tests:
                       lines.append("> no per-test summary — the job likely crashed or timed out; see the run log")
+              elif result == "cancelled":
+                  lines.append("> cancelled — usually the job's timeout-minutes; see the run log")
               return "\n".join(lines)
 
+          # One verdict for the whole night. Anything that is not a clean success
+          # across all four tiers is reported as not green: a cancelled or skipped
+          # tier ran nothing, which is not the same as passing.
+          outcomes = {result for result, _ in results.values()}
+          trigger = os.environ.get("TRIGGER", "?")
+          if outcomes == {"success"}:
+              headline = f":large_green_circle: *Nightly live e2e green* ({trigger}) — all four tiers passed"
+          elif "failure" in outcomes:
+              headline = f":rotating_light: *Nightly live e2e failed* ({trigger})"
+          else:
+              headline = f":warning: *Nightly live e2e incomplete* ({trigger}) — a tier was cancelled or skipped"
+
           text = "\n".join(
-              [
-                  f":rotating_light: *Nightly live e2e failed* ({os.environ.get('TRIGGER', '?')})",
-                  tier("local tier", os.environ.get("LOCAL_RESULT", ""), os.environ.get("LOCAL_FAILED", "")),
-                  tier("cloud tier", os.environ.get("CLOUD_RESULT", ""), os.environ.get("CLOUD_FAILED", "")),
-                  tier("hermes tier", os.environ.get("HERMES_RESULT", ""), os.environ.get("HERMES_FAILED", "")),
-                  tier("openclaw tier", os.environ.get("OPENCLAW_RESULT", ""), os.environ.get("OPENCLAW_FAILED", "")),
-                  f"<{os.environ.get('RUN_URL', '')}|Open the run>",
-              ]
+              [headline]
+              + [tier(name, result, failed) for name, (result, failed) in results.items()]
+              + [f"<{os.environ.get('RUN_URL', '')}|Open the run>"]
           )
           slack("chat.postMessage", {"channel": channel, "text": text, "unfurl_links": "false"})
-          print("failure DM sent")
+          print(f"nightly DM sent: {headline}")
           PYEOF
