@@ -5,8 +5,13 @@ Rendering contract (shared by all registered suites):
 
   * shape: ` · credits: $<n>.<nn>` (`-$3.50` when negative), optionally followed
     by ` · last <op> ~$<n>.<nn>`;
-  * gated: cloud mode only, fresh marker only (`_CREDITS_STALE_SECONDS`),
-    matching base_url only, `COGNEE_STATUSLINE_CREDITS=off` hides it;
+  * gated: cloud mode only, matching base_url only, entry younger than the
+    marker's prune horizon (`_CREDITS_MAX_AGE_SECONDS`),
+    `COGNEE_STATUSLINE_CREDITS=off` hides it;
+  * age: a reading older than `_CREDITS_AGE_HINT_SECONDS` renders with a
+    trailing ` (Nm ago)` / ` (Nh ago)` / ` (Nd ago)` hint instead of hiding —
+    there is no background poll, so an idle terminal's number is simply old,
+    not wrong;
   * a missing/malformed/balance-less marker renders nothing and never raises.
 
 Shared assertions read the segment through ``strip_ansi``. Claude Code colours
@@ -99,8 +104,10 @@ def test_local_mode_renders_nothing(statusline):
     assert statusline._credits_segment() == ""
 
 
-def test_stale_marker_renders_nothing(sl):
-    _marker(sl, checked_at=time.time() - sl._CREDITS_STALE_SECONDS - 1)
+def test_marker_past_prune_horizon_renders_nothing(sl):
+    """Older than the writer's own 7-day prune: the entry is about to vanish
+    on the next refresh anyway, and a week-old number helps nobody."""
+    _marker(sl, checked_at=time.time() - sl._CREDITS_MAX_AGE_SECONDS - 1)
     assert sl._credits_segment() == ""
 
 
@@ -175,6 +182,45 @@ def test_selects_own_tenant_among_several(sl):
     assert "999.99" not in seg
 
 
+# ── age hint (no background poll: old readings show their age) ─────────────
+
+
+def test_recent_reading_has_no_age_hint(sl):
+    _marker(sl, checked_at=time.time() - sl._CREDITS_AGE_HINT_SECONDS + 30)
+    assert strip_ansi(sl._credits_segment()) == " · credits: $14.23"
+
+
+def test_idle_reading_shows_minutes(sl):
+    _marker(sl, checked_at=time.time() - 16 * 60 - 5)
+    assert strip_ansi(sl._credits_segment()) == " · credits: $14.23 (16m ago)"
+
+
+def test_idle_reading_shows_hours(sl):
+    _marker(sl, checked_at=time.time() - 3 * 3600 - 120)
+    assert strip_ansi(sl._credits_segment()) == " · credits: $14.23 (3h ago)"
+
+
+def test_idle_reading_shows_days(sl):
+    _marker(sl, checked_at=time.time() - 2 * 86400 - 3600)
+    assert strip_ansi(sl._credits_segment()) == " · credits: $14.23 (2d ago)"
+
+
+def test_age_hint_follows_last_op(sl):
+    """Balance and cost come from the same fetch, so the hint qualifies both."""
+    _marker(
+        sl,
+        checked_at=time.time() - 45 * 60,
+        last_op={"label": "turn", "cost_usd": 0.04, "at": time.time() - 45 * 60},
+    )
+    assert strip_ansi(sl._credits_segment()) == " · credits: $14.23 · last turn ~$0.04 (45m ago)"
+
+
+def test_age_hint_matches_writer_prune_horizon(suite, sl, isolated_modules):
+    """The renderer hides exactly where the writer prunes: one horizon."""
+    pc = isolated_modules(suite, "_plugin_common")
+    assert sl._CREDITS_MAX_AGE_SECONDS == pc._CREDITS_ENTRY_MAX_AGE_SECONDS
+
+
 def test_segment_composes_after_the_mode_label(sl):
     _marker(sl)
     assert sl._credits_segment().startswith(" · ")  # no extra glue needed
@@ -200,6 +246,13 @@ def test_negative_balance_is_red(styled):
     assert styled._credits_segment() == f" · {_RED}credits: -$158.86{_RESET}"
 
 
+def test_age_hint_is_faint(styled):
+    """The hint is a qualifier, below the number in the visual hierarchy."""
+    _marker(styled, checked_at=time.time() - 20 * 60)
+    expected = f" · {_GREEN}credits: $14.23{_RESET} {_FAINT}(20m ago){_RESET}"
+    assert styled._credits_segment() == expected
+
+
 def test_last_op_is_not_faint(styled):
     """The cost is a first-class signal, unlike the recall/saved diagnostics."""
     _marker(styled, last_op={"label": "improve", "cost_usd": 0.14, "at": time.time()})
@@ -221,6 +274,13 @@ def plain(suite, sl):
 def test_segment_has_no_ansi_escapes(plain):
     _marker(plain, last_op={"label": "improve", "cost_usd": 0.14, "at": time.time()})
     assert "\033" not in plain._credits_segment()
+
+
+def test_age_hint_has_no_ansi_escapes(plain):
+    _marker(plain, checked_at=time.time() - 20 * 60)
+    seg = plain._credits_segment()
+    assert seg == " · credits: $14.23 (20m ago)"
+    assert "\033" not in seg
 
 
 def test_segment_reaches_the_host_status_string(plain):

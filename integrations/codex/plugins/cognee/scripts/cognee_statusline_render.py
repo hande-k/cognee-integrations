@@ -41,11 +41,32 @@ _CONN_STATE_DIR = _SHARED_ROOT / "codex" / "conn-state"
 _LLM_STATE_STALE_SECONDS = 30 * 60
 _CREDITS_PATH = _SHARED_ROOT / "codex" / "credits.json"
 
-# TTL for the credits balance. Written per turn (prompt + Stop hooks) and by
-# the idle watcher every ~5 minutes — older than this means every writer has
-# stopped (session over, watcher dead); hide the balance rather than show a
-# number that no longer reflects spend.
-_CREDITS_STALE_SECONDS = 15 * 60
+# Credits balance age. The marker is written only when this machine does
+# something billable (prompt start, turn end, remember, improve) — there is no
+# background poll, so an idle terminal makes no billing calls. The balance
+# cannot move from here while idle, so an old reading is still the right
+# number for this session; past this age it carries an "Nm ago" hint so the
+# user knows it predates the idle stretch. Hidden only once older than the
+# marker's own prune horizon (`_plugin_common._CREDITS_ENTRY_MAX_AGE_SECONDS`).
+_CREDITS_AGE_HINT_SECONDS = 15 * 60
+_CREDITS_MAX_AGE_SECONDS = 7 * 24 * 3600
+
+
+def _credits_age_hint(age_seconds: float) -> str:
+    """``"16m ago"`` / ``"3h ago"`` / ``"2d ago"`` once a reading is older than
+    ``_CREDITS_AGE_HINT_SECONDS``; ``""`` while it is recent enough to read as
+    current. Coarse on purpose — it says "this number predates your idle
+    stretch", not a timestamp."""
+    if age_seconds <= _CREDITS_AGE_HINT_SECONDS:
+        return ""
+    minutes = int(age_seconds // 60)
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    return f"{hours // 24}d ago"
+
 
 _DEFAULT_DATASET = "agent_sessions"
 # Must match _plugin_common._DEFAULT_LOCAL_SERVICE_URL: the hooks stamp this URL into
@@ -411,8 +432,10 @@ def _credits_segment() -> str:
     by tenant id (several terminals can be on different tenants at once), each
     entry carrying the service base_url it was observed under. Select OUR
     tenant's entry by that binding. Plain text (the Codex line carries no ANSI
-    styling). Renders nothing unless ALL of: cloud mode, matching fresh entry
-    with a numeric balance, not opted out (``COGNEE_STATUSLINE_CREDITS=off``).
+    styling). Renders nothing unless ALL of: cloud mode, matching entry with a
+    numeric balance younger than ``_CREDITS_MAX_AGE_SECONDS``, not opted out
+    (``COGNEE_STATUSLINE_CREDITS=off``). A reading older than
+    ``_CREDITS_AGE_HINT_SECONDS`` renders with an ``(Nm ago)`` age hint.
     """
     if os.environ.get("COGNEE_STATUSLINE_CREDITS", "").strip().lower() in (
         "0",
@@ -442,7 +465,8 @@ def _credits_segment() -> str:
         checked_at = float(entry.get("checked_at", 0) or 0)
     except (TypeError, ValueError):
         return ""
-    if time.time() - checked_at > _CREDITS_STALE_SECONDS:
+    age = time.time() - checked_at
+    if age > _CREDITS_MAX_AGE_SECONDS:
         return ""
     sign = "-" if remaining < 0 else ""
     seg = f" · credits: {sign}${abs(remaining):,.2f}"
@@ -452,6 +476,9 @@ def _credits_segment() -> str:
         cost = last_op.get("cost_usd")
         if label and isinstance(cost, (int, float)) and not isinstance(cost, bool):
             seg += f" · last {label} ~${cost:,.2f}"
+    hint = _credits_age_hint(age)
+    if hint:
+        seg += f" ({hint})"
     return seg
 
 
