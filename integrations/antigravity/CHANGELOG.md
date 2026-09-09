@@ -7,6 +7,24 @@ package version.
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- **No background credits polling.** The exit watcher polled the billing
+  overview every 5 minutes for the life of every open terminal so the
+  status-line balance would not age out of its 15-minute TTL while idle. That
+  was the plugin's only idle network traffic, and its throttle read a marker
+  field that does not exist until a refresh has succeeded for the connected
+  tenant — with no tenant binding (self-hosted remote server, unresolved
+  connection lookup) it fell through to a refresh attempt every 2 seconds and
+  ~14k `credits_refresh_skipped_no_tenant` log lines a day. The balance cannot
+  move from this machine while it is idle, so the poll is gone: the hook-time
+  refreshes (prompt start, turn end, remember, improve) are the whole cadence.
+  The renderer no longer hides an old reading; past 15 minutes it appends an
+  age hint (`credits: $14.23 (2h ago)`), and hides only once the entry is
+  older than the marker's own 7-day prune. `COGNEE_CREDITS_CHECK_INTERVAL` and
+  the `exit-watcher:credits_check_error` event are retired.
+
 ## [1.5.0]
 
 ### Added

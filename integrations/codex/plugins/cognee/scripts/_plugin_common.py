@@ -3310,7 +3310,7 @@ def refresh_credits(op_label: str = "", *, tenant_id: str = "", timeout: float =
     """Fetch the cloud credits overview and update this tenant's marker entry.
 
     Best-effort by contract: any failure returns {} and leaves the existing
-    marker untouched — the renderer's staleness TTL handles an aging balance,
+    marker untouched — the renderer shows the age of an old reading instead,
     and a fetch problem must never propagate into the calling hook.
 
     ``tenant_id`` comes from ``load_resolved()`` (the connections/me lookup)
