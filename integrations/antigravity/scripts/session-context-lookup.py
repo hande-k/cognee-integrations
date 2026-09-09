@@ -392,8 +392,9 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
     # concurrent, a per-scope timeout and a whole-recall budget would bound the
     # very same interval. COGNEE_RECALL_TIMEOUT is NOT read here — it still
     # bounds the explicit cognee-search path (_cognee_client.py).
+    recall_budget = _float_env("COGNEE_RECALL_BUDGET", 4.0)
     recall_start = time.monotonic()
-    budget_deadline = recall_start + _float_env("COGNEE_RECALL_BUDGET", 4.0)
+    budget_deadline = recall_start + recall_budget
     # Respect the shared circuit breaker: when the server has been failing (tripped
     # by the explicit recall path), skip this per-prompt recall rather than hammering
     # a down backend on every keystroke. HTTP/cloud mode only.
@@ -423,7 +424,9 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
     if scope_specs and remaining < MIN_SCOPE_TIMEOUT:
         hook_log("recall_budget_exceeded", {"collected": 0})
         scope_specs = []
-    scope_timeout = max(remaining, 0.0)
+    # Clamped into [0, budget]: on a coarse clock (Windows) ``remaining`` can
+    # read a few ULPs above the budget when no tick has passed since the start.
+    scope_timeout = min(recall_budget, max(remaining, 0.0))
 
     # Everything the calls need is resolved once, up front, on the event loop
     # thread: the dataset routing reads plugin state files, and the answer is

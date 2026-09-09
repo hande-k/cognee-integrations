@@ -131,10 +131,18 @@ def test_drain_skipped_when_lock_busy(pc, monkeypatch):
     assert calls == []
 
 
-def test_concurrent_appends_do_not_lose_entries(pc):
+def test_concurrent_appends_do_not_lose_entries(pc, monkeypatch):
     # Two async hooks appending at the same moment must both land: the buffer
     # mutex serializes the read-modify-write, so the last writer no longer
     # clobbers the other's entry.
+    #
+    # The mutex fails OPEN after _BUFFER_LOCK_TIMEOUT_SECONDS (1s) by design —
+    # a rare lost update beats a hook that hangs. Eight writers queueing on a
+    # slow CI runner (Windows) can push the last one past that second and
+    # into the documented lost-update path, which is not what this test is
+    # about. Pin the wait high so what is asserted is serialization, not the
+    # runner's speed; the fail-open path has its own test below.
+    monkeypatch.setattr(pc, "_BUFFER_LOCK_TIMEOUT_SECONDS", 30.0)
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         list(
             ex.map(
