@@ -19,10 +19,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
   the results are folded into the same injected context, in the same order.
   With the graph search the only expensive call, a prompt's recall now costs
   about what the graph search alone costs.
-  - `COGNEE_RECALL_TIMEOUT` and `COGNEE_RECALL_BUDGET` keep their defaults
-    (2.5s per scope, 4s overall), but every scope now gets the same deadline — the smaller of
-    the two — instead of whatever earlier scopes left over. `recall_budget_exceeded`
-    fires only when the budget is too small for any request at all.
+  - The per-prompt recall now has one knob: `COGNEE_RECALL_BUDGET` (default
+    4s) is the deadline every scope gets. With the scopes concurrent, a
+    per-scope timeout and a whole-recall budget bounded the same interval, so
+    `COGNEE_RECALL_TIMEOUT` is no longer read by this hook (it still bounds the
+    explicit `cognee-search` path). `recall_budget_exceeded` fires only when
+    the budget is too small for any request at all.
   - A refused connection or a 401/403 no longer cuts the fan-out short (every
     request is already in flight and fails in the same round trip); it is still
     recorded as one verdict per prompt, never one per scope.

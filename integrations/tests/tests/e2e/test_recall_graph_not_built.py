@@ -24,12 +24,12 @@ def test_graph_404_is_not_a_recall_error(
         "session-context-lookup.py",
         stdin=payloads.user_prompt(prompt="what did we decide about the retry policy?"),
         service_url=mock_server.url,
-        # The graph scope runs last, and the hook stops dispatching scopes once its
-        # per-prompt budget (default 4s) is spent. On the Windows runner every
-        # request to the mock takes ~2s, so with the defaults only two scopes ran
-        # and the graph scope — the one this test is about — was never attempted.
-        # The budget is a production latency guard, not the behaviour under test.
-        env={"COGNEE_RECALL_TIMEOUT": "30", "COGNEE_RECALL_BUDGET": "120"},
+        # Every scope shares the per-prompt budget as its deadline. On the Windows
+        # runner a request to the mock can take seconds, and a scope that times
+        # out is recorded as a slow recall_error rather than the 404 this test is
+        # about. The budget is a production latency guard, not the behaviour
+        # under test, so it is raised well clear of the runner's latency.
+        env={"COGNEE_RECALL_BUDGET": "120"},
     )
     assert result.returncode == 0, result.stderr
 

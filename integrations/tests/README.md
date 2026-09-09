@@ -219,8 +219,9 @@ Non-obvious rules this tier encodes (each one learned by getting it wrong —
   "poll recall until the content comes back".
 - **The venv is seeded** from the host's `~/.cognee-plugin/venv` so boot is ~15s
   instead of a multi-minute `uv` install. That caches the *install* only.
-- **Recall timeouts are raised** (`COGNEE_RECALL_TIMEOUT`/`_BUDGET`). Production
-  keeps them tight (10s/12s) so memory can never stall an interactive prompt, and
+- **Recall deadlines are raised** (`COGNEE_RECALL_BUDGET` for the per-prompt hook,
+  `COGNEE_RECALL_TIMEOUT` for the explicit search path). Production
+  keeps them tight (12s per prompt) so memory can never stall an interactive prompt, and
   a cold server's first graph query correctly exceeds that. These tests ask
   whether memory crosses sessions, not whether cold-start recall is fast — so
   cold-start deserves its own scenario rather than silently failing this one.

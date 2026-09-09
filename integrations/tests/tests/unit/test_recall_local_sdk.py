@@ -45,7 +45,6 @@ def test_every_scope_is_awaited_together(lookup, monkeypatch):
         await asyncio.sleep(0.3)
         return []
 
-    monkeypatch.setenv("COGNEE_RECALL_TIMEOUT", "5")
     monkeypatch.setenv("COGNEE_RECALL_BUDGET", "5")
     started = time.monotonic()
     run = drive_recall(lookup, monkeypatch, mode="local_sdk", sdk_recall=slow)
@@ -104,8 +103,7 @@ def test_a_scope_past_the_deadline_is_cut_while_the_others_land(lookup, monkeypa
             return [{"source": "graph", "content": "too late"}]
         return [{"question": f"q-{scope}", "answer": "a"}] if scope == "session" else []
 
-    monkeypatch.setenv("COGNEE_RECALL_TIMEOUT", "0.4")
-    monkeypatch.setenv("COGNEE_RECALL_BUDGET", "5")
+    monkeypatch.setenv("COGNEE_RECALL_BUDGET", "0.4")
     started = time.monotonic()
     run = drive_recall(lookup, monkeypatch, mode="local_sdk", sdk_recall=one_hangs)
     wall = time.monotonic() - started

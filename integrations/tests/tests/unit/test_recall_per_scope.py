@@ -13,8 +13,9 @@ Contract:
     ``counts`` buckets it into ``graph_context``;
   * an open breaker runs nothing yet still reports all four as skipped;
   * the scopes are dispatched concurrently, every one with the same deadline —
-    the per-scope timeout clamped to the whole budget — so the prompt waits for
-    the slowest scope, not the sum, and no scope waits behind another;
+    the whole budget — so the prompt waits for the slowest scope, not the sum,
+    and no scope waits behind another; the budget is the only knob, so
+    ``COGNEE_RECALL_TIMEOUT`` is ignored here;
   * a budget too small for any honest attempt dispatches nothing at all;
   * the synchronous prompt hook never drains the warmup buffer.
 
@@ -102,26 +103,21 @@ def test_an_open_breaker_skips_every_scope_but_still_reports(lookup, monkeypatch
     assert run.calls == [], f"breaker open must dispatch nothing, got {run.calls}"
 
 
-def test_every_scope_gets_the_same_deadline_clamped_to_the_budget(lookup, monkeypatch):
-    """One deadline for the whole fan-out: min(per-scope timeout, budget).
+def test_every_scope_gets_the_whole_budget_as_its_deadline(lookup, monkeypatch):
+    """One deadline for the whole fan-out: the budget, and only the budget.
 
-    With a 0.5s per-call timeout and a 0.8s budget every scope gets 0.5s; with a
-    0.3s budget every scope is clamped to ~0.3s. Nobody is handed the budget
-    "remaining after earlier scopes" any more, because nothing runs earlier —
-    all four are in flight together, so the recall can never outlast the
-    smaller of the two knobs.
+    Nobody is handed the budget "remaining after earlier scopes" any more,
+    because nothing runs earlier — all four are in flight together. And with
+    the scopes concurrent, a per-scope timeout would bound the very same
+    interval, so the hook no longer reads ``COGNEE_RECALL_TIMEOUT``: set it to
+    anything and the deadline stays the budget.
     """
-    monkeypatch.setenv("COGNEE_RECALL_TIMEOUT", "0.5")
     monkeypatch.setenv("COGNEE_RECALL_BUDGET", "0.8")
+    monkeypatch.setenv("COGNEE_RECALL_TIMEOUT", "0.1")
     run = drive_recall(lookup, monkeypatch, recall={scope: [] for scope in SCOPES})
     assert set(run.timeouts) == set(SCOPES), run.timeouts
-    assert all(t == 0.5 for t in run.timeouts.values()), run.timeouts
-
-    monkeypatch.setenv("COGNEE_RECALL_BUDGET", "0.3")
-    run = drive_recall(lookup, monkeypatch, recall={scope: [] for scope in SCOPES})
-    assert set(run.timeouts) == set(SCOPES), run.timeouts
-    assert all(0.2 <= t <= 0.3 for t in run.timeouts.values()), (
-        f"expected every scope clamped to the budget: {run.timeouts}"
+    assert all(0.7 <= t <= 0.8 for t in run.timeouts.values()), (
+        f"expected every scope to get the budget as its deadline: {run.timeouts}"
     )
     assert not run.fired("recall_budget_exceeded"), run.events
 
@@ -140,7 +136,6 @@ def test_scopes_run_concurrently_so_the_prompt_waits_for_the_slowest(lookup, mon
         time.sleep(sleeps.get(kw["scope"][0], 0))
         return []
 
-    monkeypatch.setenv("COGNEE_RECALL_TIMEOUT", "5")
     monkeypatch.setenv("COGNEE_RECALL_BUDGET", "5")
     started = time.monotonic()
     run = drive_recall(lookup, monkeypatch, recall=slow_recall)

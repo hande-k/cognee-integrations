@@ -22,7 +22,7 @@ import time
 import pytest
 from utils.hooklog import hook_events
 
-#: Per-scope timeout and whole budget handed to the hook, in seconds. Well above
+#: The recall budget handed to the hook, in seconds: every scope's deadline. Well above
 #: MIN_SCOPE_TIMEOUT so every scope is dispatched, well below the default so
 #: the test is quick.
 DEADLINE_S = 1.0
@@ -90,10 +90,7 @@ def test_a_silent_server_costs_one_deadline_and_the_hook_still_exits_clean(
         "session-context-lookup.py",
         stdin=payloads.user_prompt(prompt="what did we decide about the retry policy?"),
         service_url=black_hole.url,
-        env={
-            "COGNEE_RECALL_TIMEOUT": str(DEADLINE_S),
-            "COGNEE_RECALL_BUDGET": str(DEADLINE_S),
-        },
+        env={"COGNEE_RECALL_BUDGET": str(DEADLINE_S)},
         # Generous: a hang here is exactly the bug. A healthy run is interpreter
         # start-up plus one deadline.
         timeout=60.0,

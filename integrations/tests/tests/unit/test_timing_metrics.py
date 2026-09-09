@@ -103,7 +103,6 @@ def test_the_aggregate_is_the_fan_out_wall_time_not_the_sum_of_scopes(lookup, mo
         time.sleep(sleeps.get(kw["scope"][0], 0))
         return []
 
-    monkeypatch.setenv("COGNEE_RECALL_TIMEOUT", "5")
     monkeypatch.setenv("COGNEE_RECALL_BUDGET", "5")
     run = drive_recall(lookup, monkeypatch, recall=slow)
 

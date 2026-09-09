@@ -240,9 +240,10 @@ def build_live_env(
             "COGNEE_UPDATE_CHECK": "off",
             "COGNEE_IDLE_DISABLED": "1",
             "COGNEE_SYNC_START_DELAY": "0.5",
-            # Test-only patience for the per-prompt recall. In production these
-            # are deliberately tight (COGNEE_RECALL_TIMEOUT 10s per scope,
-            # COGNEE_RECALL_BUDGET 12s overall) so memory can never stall an
+            # Test-only patience for recall. In production the per-prompt hook's
+            # COGNEE_RECALL_BUDGET is deliberately tight (12s, the deadline every
+            # concurrent scope gets; COGNEE_RECALL_TIMEOUT bounds only the
+            # explicit search path) so memory can never stall an
             # interactive prompt — and on a *cold* server the first graph query
             # exceeds that and is correctly dropped as "slow". These tests ask
             # "does memory cross sessions", not "is cold-start recall fast", so

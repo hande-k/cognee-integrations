@@ -69,8 +69,8 @@ TRUNCATE_ANSWER = 500
 TRUNCATE_RETURN = 400
 TRUNCATE_GRAPH_CTX = 1500
 RECENT_TRACE_FALLBACK_TOP_K = 5
-# Smallest per-scope timeout worth dispatching; with less budget than this
-# left, remaining scopes are skipped rather than fired with a doomed deadline.
+# Smallest deadline worth dispatching; with less budget than this, nothing is
+# fired rather than sending every scope a doomed request.
 MIN_SCOPE_TIMEOUT = 0.2
 
 
@@ -386,10 +386,12 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
 
     # Hard time-box: this hook is on the keystroke->answer path, so recall must
     # never be the long pole. Every scope is dispatched at once with the same
-    # deadline — min(per-scope timeout, whole budget) — so the recall can never
-    # outlast the budget and no scope waits behind another. A scope that
-    # overruns is recorded as zero hits; partial results are fine.
-    recall_timeout = _float_env("COGNEE_RECALL_TIMEOUT", 2.5)
+    # deadline, the whole budget, so the recall can never outlast it and no
+    # scope waits behind another. A scope that overruns is recorded as zero
+    # hits; partial results are fine. One knob on purpose: with the scopes
+    # concurrent, a per-scope timeout and a whole-recall budget would bound the
+    # very same interval. COGNEE_RECALL_TIMEOUT is NOT read here — it still
+    # bounds the explicit cognee-search path (_cognee_client.py).
     recall_start = time.monotonic()
     budget_deadline = recall_start + _float_env("COGNEE_RECALL_BUDGET", 4.0)
     # Respect the shared circuit breaker: when the server has been failing (tripped
@@ -421,7 +423,7 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
     if scope_specs and remaining < MIN_SCOPE_TIMEOUT:
         hook_log("recall_budget_exceeded", {"collected": 0})
         scope_specs = []
-    scope_timeout = min(recall_timeout, max(remaining, 0.0))
+    scope_timeout = max(remaining, 0.0)
 
     # Everything the calls need is resolved once, up front, on the event loop
     # thread: the dataset routing reads plugin state files, and the answer is
