@@ -10,7 +10,7 @@ is the cache key and semver record, bumped on each release, not the update trigg
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.6.4]
 
 ### Changed
 - **No background credits polling.** The exit watcher polled the billing
