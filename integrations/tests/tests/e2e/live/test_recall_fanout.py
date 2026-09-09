@@ -21,7 +21,7 @@ from __future__ import annotations
 import concurrent.futures
 
 import pytest
-from utils.live import hook_events, read_last_recall
+from utils.live import hook_events
 
 pytestmark = pytest.mark.live
 
@@ -99,25 +99,28 @@ def test_the_recall_costs_the_slowest_scope_not_the_sum(
 
 @pytest.mark.local_only
 def test_parallel_sessions_recall_at_once_without_errors(
-    live_session_factory, started_session, live_suite, live_home, nonce
+    started_session, live_suite, live_home, nonce
 ):
     """Three terminals prompting at the same moment: 12+ concurrent graph-store reads.
 
     Each hook already fans out; several sessions multiply that against one local
-    Ladybug. Every hook must exit clean, every scope must have run, and no scope
-    may report an error (a locked or contended store would surface here).
+    Ladybug. Each session first captures its own fact, so its recall has
+    something to find in its own session cache without waiting on a cognify:
+    every hook must exit clean, every scope must have run, no scope may report
+    an error (a locked or contended store would surface here), and every one of
+    the concurrent recalls must actually return its own fact.
     """
-    anchor = started_session("fanout-anchor")
-    anchor.prompt(f"Shared fact: {nonce} ships on Tuesdays.", turn_id="t1")
-    anchor.answer(f"Noted: {nonce} ships on Tuesdays.", turn_id="t1")
-
     sessions = [started_session(f"fanout-par-{i}") for i in range(3)]
+    for i, session in enumerate(sessions):
+        session.prompt(f"Session {i} of {nonce} ships on Tuesdays.", turn_id="t1")
+        session.answer(f"Noted: session {i} of {nonce} ships on Tuesdays.", turn_id="t1")
 
-    def recall(session, i: int):
-        return session.recall(f"When does {nonce} ship? ({i})", turn_id="t1")
+    def recall(pair):
+        i, session = pair
+        return session.recall(f"When does session {i} of {nonce} ship?", turn_id="t2")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(sessions)) as pool:
-        runs = list(pool.map(lambda pair: recall(*pair), enumerate(sessions)))
+        runs = list(pool.map(recall, enumerate(sessions)))
 
     for i, run in enumerate(runs):
         assert run.ok, f"parallel recall {i} failed (rc={run.returncode}): {run.stderr[:500]}"
@@ -125,8 +128,10 @@ def test_parallel_sessions_recall_at_once_without_errors(
     errors = _scope_errors(live_suite, live_home)
     assert not errors, f"scope errors under parallel sessions: {errors}"
     summaries = _recall_summaries(live_suite, live_home)[-len(sessions) :]
+    assert len(summaries) == len(sessions), summaries
     for summary in summaries:
         assert all(not r.get("skipped") for r in summary["per_scope"].values()), summary
-    # The bar's structural evidence: the last recall saw the shared fact somewhere.
-    hits = read_last_recall(live_suite, live_home).get("hits") or {}
-    assert isinstance(hits, dict), hits
+        found = sum(int(r.get("hits") or 0) for r in summary["per_scope"].values())
+        assert found > 0, (
+            f"a concurrent recall came back empty for its own captured turn: {summary}"
+        )

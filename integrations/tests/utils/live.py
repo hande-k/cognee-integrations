@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .hooklog import hook_events
 from .suites import Suite, state_dir
 
 #: The port a developer's own cognee almost certainly occupies.
@@ -300,21 +301,6 @@ def kill_server(base_url: str, port: int, *, deadline: float = 30.0) -> list[str
             return killed
         time.sleep(0.5)
     raise AssertionError(f"server on {base_url} still answering {deadline}s after kill {killed}")
-
-
-def hook_events(suite: Suite, home: Path) -> list[tuple[str, dict]]:
-    """Every (event, detail) the hooks have logged so far, in order."""
-    path = state_dir(suite, home) / "hook.log"
-    if not path.exists():
-        return []
-    events: list[tuple[str, dict]] = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        try:
-            entry = json.loads(line)
-        except Exception:
-            continue
-        events.append((str(entry.get("event", "")), entry.get("detail") or {}))
-    return events
 
 
 def read_last_recall(suite: Suite, home: Path) -> dict:

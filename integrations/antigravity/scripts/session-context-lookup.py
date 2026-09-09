@@ -20,6 +20,7 @@ import time
 # Add scripts dir to path for helper imports
 sys.path.insert(0, os.path.dirname(__file__))
 from _plugin_common import (
+    _float_env,
     authed_liveness,
     bounded_dim_mismatch_hint,
     clear_slow_streak,
@@ -61,13 +62,6 @@ def _audit_clip(value, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"…[+{len(text) - limit} chars]"
-
-
-def _float_env(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, "") or default)
-    except (TypeError, ValueError):
-        return default
 
 
 TOP_K = 5

@@ -12,23 +12,7 @@ sharp: the graph scope must be the only one *not* reported as an error.
 
 from __future__ import annotations
 
-import json
-
-from utils.suites import state_dir
-
-
-def _events(suite, home):
-    log = state_dir(suite, home) / "hook.log"
-    if not log.exists():
-        return []
-    out = []
-    for line in log.read_text(encoding="utf-8").splitlines():
-        try:
-            entry = json.loads(line)
-        except ValueError:
-            continue
-        out.append((entry.get("event"), entry.get("detail") or {}))
-    return out
+from utils.hooklog import hook_events
 
 
 def test_graph_404_is_not_a_recall_error(
@@ -49,7 +33,7 @@ def test_graph_404_is_not_a_recall_error(
     )
     assert result.returncode == 0, result.stderr
 
-    events = _events(suite, temp_home)
+    events = hook_events(suite, temp_home)
     assert not [d for e, d in events if e == "recall_budget_exceeded"], (
         "the budget must not cut the scope loop short in this test"
     )

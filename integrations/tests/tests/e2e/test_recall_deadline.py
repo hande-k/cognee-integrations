@@ -15,13 +15,12 @@ against a socket that accepts the connection and then says nothing, and pins:
 
 from __future__ import annotations
 
-import json
 import socket
 import threading
 import time
 
 import pytest
-from utils.suites import state_dir
+from utils.hooklog import hook_events
 
 #: Per-scope timeout and whole budget handed to the hook, in seconds. Well above
 #: MIN_SCOPE_TIMEOUT so every scope is dispatched, well below the default so
@@ -82,20 +81,6 @@ def black_hole():
         server.close()
 
 
-def _events(suite, home):
-    log = state_dir(suite, home) / "hook.log"
-    if not log.exists():
-        return []
-    out = []
-    for line in log.read_text(encoding="utf-8").splitlines():
-        try:
-            entry = json.loads(line)
-        except ValueError:
-            continue
-        out.append((entry.get("event"), entry.get("detail") or {}))
-    return out
-
-
 def test_a_silent_server_costs_one_deadline_and_the_hook_still_exits_clean(
     suite, run_hook, black_hole, payloads, temp_home, assert_clean_real_home
 ):
@@ -116,7 +101,7 @@ def test_a_silent_server_costs_one_deadline_and_the_hook_still_exits_clean(
     wall = time.monotonic() - started
     assert result.returncode == 0, result.stderr
 
-    events = _events(suite, temp_home)
+    events = hook_events(suite, temp_home)
     errors = [d for e, d in events if e == "recall_error"]
     assert len(errors) == 4, f"expected every scope to time out once: {errors}"
     assert {tuple(d["scope"]) for d in errors} == {

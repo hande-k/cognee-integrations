@@ -20,6 +20,7 @@ import time
 # Add scripts dir to path for helper imports
 sys.path.insert(0, os.path.dirname(__file__))
 from _plugin_common import (
+    _float_env,
     authed_liveness,
     clear_slow_streak,
     elapsed_ms,
@@ -57,13 +58,6 @@ def _audit_clip(value, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"…[+{len(text) - limit} chars]"
-
-
-def _float_env(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, "") or default)
-    except (TypeError, ValueError):
-        return default
 
 
 TOP_K = 5
@@ -415,10 +409,7 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
             continue
         import urllib.error as _urlerr
 
-        if isinstance(exc, asyncio.TimeoutError):
-            verdict = SLOW  # pre-3.11 asyncio.TimeoutError isn't TimeoutError
-        else:
-            verdict = classify_transport_exception(exc)
+        verdict = classify_transport_exception(exc)
         if isinstance(exc, _urlerr.HTTPError) and exc.code == 404 and scope_list == ["graph"]:
             # A dataset nobody has written to yet has no graph, and the
             # server answers the graph scope with 404 (DatasetNotFound)
