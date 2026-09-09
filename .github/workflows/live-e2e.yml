@@ -133,11 +133,12 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: false
     # No venv to build and no server to boot, but NOT the fast half: the scenarios
-    # are the same 40-odd graph round trips as the local job, and each cognify now
-    # runs on the shared tenant rather than a warm local server. Sized like the
-    # local job — at 45 minutes the run was cut off with two tests reported and
-    # no tracebacks (pytest holds failure output until the session ends).
-    timeout-minutes: 75
+    # are the same 40-odd graph round trips as the local job, and each cognify
+    # runs on the shared tenant rather than a warm local server. The first full
+    # run took 50 minutes; at 45 the job was cut off with two tests reported and
+    # no tracebacks (pytest holds failure output until the session ends). Sized
+    # with headroom for a slow tenant night rather than to the median.
+    timeout-minutes: 100
     # Independent of the local job on purpose: a cloud outage should not hide a
     # local regression, and vice versa. Both still serialise via `concurrency`.
     outputs:

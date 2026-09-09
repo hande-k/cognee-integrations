@@ -379,6 +379,7 @@ def session_for(
     live_project: Path,
     live_base_url: str,
     live_dataset: str,
+    live_api_key: str,
     live_port: int,
 ):
     """Boot a session for an *explicitly named* suite, sharing one server.
@@ -390,6 +391,13 @@ def session_for(
     Every session shares the HOME, port, and dataset — so the graph is shared while
     each suite keeps its own state subdirectory, which is exactly the arrangement
     the shared-brain claim rests on.
+
+    Builds its own env rather than reusing ``live_env`` (which is bound to the
+    parametrised suite), so it must thread the same ``api_key``. Without it the
+    cross-suite sessions were the only ones running keyless on cloud: the plugin
+    cannot mint against a tenant, every store got 401, and the final sync gave up
+    with "no server credentials resolved" — a failure that looked like a
+    shared-memory bug and was really this fixture.
     """
 
     def _make(suite: Suite, name: str, *, start: bool = True) -> LiveSession:
@@ -404,6 +412,7 @@ def session_for(
                 dataset=live_dataset,
                 llm_api_key=live_prereqs,
                 suite=suite,
+                api_key=live_api_key,
             ),
             session_id=f"live-{name}-{uuid.uuid4().hex[:8]}",
         )
