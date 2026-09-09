@@ -2,10 +2,10 @@
 """Search session + trace + agent guidance + graph for context relevant to the user's prompt.
 
 Runs on the Antigravity PreInvocation hook. Calls ``cognee.recall`` once per
-scope (``session``, ``trace``, ``session_context``, ``graph``) so every
-layer the SessionManager holds (QA entries, agent trace steps, standing
-agent guidance, and the graph knowledge built by ``improve()``) flows back
-into Antigravity's context.
+scope (``session``, ``trace``, ``session_context``, ``graph``), all dispatched
+concurrently, so every layer the SessionManager holds (QA entries, agent trace
+steps, standing agent guidance, and the graph knowledge built by ``improve()``)
+flows back into Antigravity's context.
 
 Configuration:
     Resolves session state via Cognee HTTP endpoints.
@@ -23,6 +23,7 @@ from _plugin_common import (
     authed_liveness,
     bounded_dim_mismatch_hint,
     clear_slow_streak,
+    elapsed_ms,
     get_session_key,
     hook_log,
     load_resolved,
@@ -325,19 +326,24 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
     # (store-user-prompt.py) drains instead; improve/SessionEnd re-drain too.
     saves_last_turn = read_and_reset_save_counter(session_id)
 
-    # Run scopes independently: a failure in one (e.g. graph search hitting an
-    # empty/locked Ladybug DB) must not discard hits already collected from the
-    # others. cognee.recall loops over scopes and re-raises on the first failure,
-    # so we call it once per scope and collect whatever succeeds.
+    # Run scopes independently AND concurrently. Independently: a failure in
+    # one (e.g. graph search hitting an empty/locked Ladybug DB) must not
+    # discard hits from the others — cognee.recall loops over scopes and
+    # re-raises on the first failure, so every scope is its own call.
+    # Concurrently: the scopes share nothing (the session layers read the
+    # session cache, graph and code hit the graph store), so all of them are
+    # dispatched at once and the prompt waits for the slowest one instead of
+    # the sum. Sequentially, every cheap scope cost a full round trip on top of
+    # the graph search — three of them on a cloud server — and the code lane,
+    # when armed, could burn seconds before graph even started. Every result
+    # still lands in the same injected context.
     results: list = []
-    # Cheap scopes first (tens of ms each), the graph search last: it is the
-    # only call that can consume a full per-call timeout, and running it
-    # earlier starved session_context out of the budget entirely. A single
-    # graph scope on purpose: the server (cognee >= 1.4) aliases the old
-    # graph_context scope to graph, so a graph_context + graph pair ran the
-    # same full graph retrieval twice per prompt. HYBRID_COMPLETION combines
-    # BM25 + vector + graph retrieval (with only_context=True the LLM
-    # completion is skipped server-side either way).
+    # A single graph scope on purpose: the server (cognee >= 1.4) aliases the
+    # old graph_context scope to graph, so a graph_context + graph pair ran
+    # the same full graph retrieval twice per prompt. HYBRID_COMPLETION
+    # combines BM25 + vector + graph retrieval (with only_context=True the LLM
+    # completion is skipped server-side either way). The list order is the
+    # canonical reporting order (per_scope, logs), not a dispatch order.
     scope_specs = [
         (["session"], None, None),
         (["trace"], None, None),
@@ -349,8 +355,7 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
     # user indexed via cognee-index-repo.sh — never on conversational prompts,
     # never as a replacement for the semantic scopes. The server keeps this
     # scope explicit-only (scope=auto never implies it), so the gate lives
-    # here. Placed before graph: the code lane is the cheapest call when its
-    # snapshot is warm, and graph is the long pole that must stay last.
+    # here.
     code_lane = {}
     try:
         from _code_graph import auto_code_lane
@@ -376,20 +381,23 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
     # Per-scope instrumentation (WS7 observability): capture {hits, elapsed_ms}
     # for every scope, keyed by its stable label. Pre-seed all scopes as
     # skipped, in canonical order and before the breaker-open branch below can
-    # blank scope_specs, so the event always carries the full set; the loop
-    # overwrites each scope that actually runs. Purely additive: it must not
-    # touch recall results, ordering, or control flow, and must never raise into
-    # the keystroke->answer path.
+    # blank scope_specs, so the event always carries the full set; each scope
+    # that actually runs overwrites its own record. Purely additive: it must
+    # not touch recall results, ordering, or control flow, and must never raise
+    # into the keystroke->answer path.
     per_scope: dict[str, dict] = {
         scope_list[0]: {"hits": 0, "elapsed_ms": 0, "skipped": True}
         for scope_list, _qtype, _profile in scope_specs
     }
 
     # Hard time-box: this hook is on the keystroke->answer path, so recall must
-    # never be the long pole. Each scope gets a short per-call timeout, and the
-    # whole loop stops once the overall budget is spent. Partial results are fine.
+    # never be the long pole. Every scope is dispatched at once with the same
+    # deadline — min(per-scope timeout, whole budget) — so the recall can never
+    # outlast the budget and no scope waits behind another. A scope that
+    # overruns is recorded as zero hits; partial results are fine.
     recall_timeout = _float_env("COGNEE_RECALL_TIMEOUT", 2.5)
-    budget_deadline = time.monotonic() + _float_env("COGNEE_RECALL_BUDGET", 4.0)
+    recall_start = time.monotonic()
+    budget_deadline = recall_start + _float_env("COGNEE_RECALL_BUDGET", 4.0)
     # Respect the shared circuit breaker: when the server has been failing (tripped
     # by the explicit recall path), skip this per-prompt recall rather than hammering
     # a down backend on every keystroke. HTTP/cloud mode only.
@@ -412,39 +420,51 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
     server_down = False
     auth_rejected = False  # 401/403: the server answered and rejected OUR key
     server_errors = 0  # 5xx answers: reachable but failing
-    for scope_list, qtype, context_profile in scope_specs:
-        # Clamp each call to what is left of the budget so a single scope can
-        # never overshoot the deadline (previously a scope dispatched just
-        # before the deadline could run a full recall_timeout past it). Below
-        # the floor a call cannot return anything useful, so skip the
-        # remaining scopes instead of firing a doomed request.
-        remaining = budget_deadline - time.monotonic()
-        if remaining < MIN_SCOPE_TIMEOUT:
-            hook_log("recall_budget_exceeded", {"collected": len(results)})
-            break
-        scope_timeout = min(recall_timeout, remaining)
-        # The code lane searches the indexed repo's own (narrow) dataset with
-        # a structured query; every other scope keeps the session dataset.
+
+    # Below the floor a call cannot return anything useful, so nothing is
+    # dispatched rather than firing requests with a doomed deadline.
+    remaining = budget_deadline - time.monotonic()
+    if scope_specs and remaining < MIN_SCOPE_TIMEOUT:
+        hook_log("recall_budget_exceeded", {"collected": 0})
+        scope_specs = []
+    scope_timeout = min(recall_timeout, max(remaining, 0.0))
+
+    # Everything the calls need is resolved once, up front, on the event loop
+    # thread: the dataset routing reads plugin state files, and the answer is
+    # the same for every scope. The code lane searches the indexed repo's own
+    # (narrow) dataset with a structured query; every other scope keeps the
+    # session dataset. Shared memory addresses the session dataset by UUID:
+    # graph-only recall spans the canonical parent-owned copy plus any readable
+    # same-named ones, while a scope that includes session history stays bound
+    # to the ONE dataset the session writes to. The code dataset stays
+    # name-addressed — it is this repo's own dataset.
+    session_dataset = get_dataset(config)
+    write_id, read_ids = resolve_active_dataset_ids() if scope_specs else ("", [])
+
+    async def _dispatch(scope_list: list, qtype, context_profile):
+        """One scope's call. Returns ``(dataset, part, exc, elapsed_ms)``.
+
+        Never raises, so one failing scope cannot take the others down with it.
+        ``elapsed_ms`` is measured around the call and recorded even when it
+        errored. In cloud mode the blocking HTTP call runs in a worker thread;
+        in local-SDK mode ``cognee.recall`` is awaited directly, so the scopes
+        interleave on this event loop.
+        """
         is_code_scope = bool(code_lane) and scope_list == ["code"]
-        scope_dataset = code_lane["dataset"] if is_code_scope else get_dataset(config)
+        scope_dataset = code_lane["dataset"] if is_code_scope else session_dataset
         scope_code_query = code_lane["code_query"] if is_code_scope else None
-        # Shared memory addresses the session dataset by UUID: graph-only
-        # recall spans the canonical parent-owned copy plus any readable
-        # same-named ones, while a scope that includes session history stays
-        # bound to the ONE dataset the session writes to. The code dataset
-        # stays name-addressed — it is this repo's own dataset.
         if is_code_scope:
             scope_dataset_ids = []
         else:
-            write_id, read_ids = resolve_active_dataset_ids()
             scope_dataset_ids = (
                 read_ids if scope_list == ["graph"] else [write_id] if write_id else []
             )
-        part = None
+        part, exc = None, None
         t0 = time.monotonic()
         try:
             if cloud_mode:
-                part = recall_via_http(
+                part = await asyncio.to_thread(
+                    recall_via_http,
                     prompt,
                     session_id=session_id,
                     top_k=TOP_K,
@@ -477,56 +497,64 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
                     ),
                     timeout=scope_timeout,
                 )
+        except Exception as caught:
+            exc = caught
+        return scope_dataset, part, exc, round((time.monotonic() - t0) * 1000, 1)
+
+    outcomes = await asyncio.gather(
+        *(_dispatch(scope_list, qtype, profile) for scope_list, qtype, profile in scope_specs)
+    )
+
+    # Fold every scope's outcome in, in canonical order, so the injected
+    # context and the logs read the same whichever call answered first.
+    for (scope_list, _qtype, _profile), (scope_dataset, part, exc, elapsed) in zip(
+        scope_specs, outcomes
+    ):
+        # hits = raw count from this scope's call (pre-bucketing/filtering).
+        per_scope[scope_list[0]] = {"hits": len(part or []), "elapsed_ms": elapsed}
+        if exc is None:
             if part:
                 results.extend(part)
             scopes_ok += 1
-        except Exception as exc:
-            import urllib.error as _urlerr
+            continue
+        import urllib.error as _urlerr
 
-            if isinstance(exc, asyncio.TimeoutError):
-                verdict = SLOW  # pre-3.11 asyncio.TimeoutError isn't TimeoutError
-            else:
-                verdict = classify_transport_exception(exc)
-            if isinstance(exc, _urlerr.HTTPError) and exc.code == 404 and scope_list == ["graph"]:
-                # A dataset nobody has written to yet has no graph, and the
-                # server answers the graph scope with 404 (DatasetNotFound)
-                # until the first cognify lands. On a fresh install that is
-                # every prompt of the first session — expected, not an error:
-                # keep it out of recall_error and the health accounting
-                # (scopes_answered_err) so real failures stay visible (SDK-469).
-                hook_log("recall_graph_not_built", {"scope": scope_list, "dataset": scope_dataset})
-            else:
-                if isinstance(exc, _urlerr.HTTPError):
-                    scopes_answered_err += 1
-                    if exc.code in (401, 403):
-                        auth_rejected = True
-                    elif exc.code >= 500:
-                        server_errors += 1
-                elif verdict == SLOW:
-                    scope_timeouts += 1
-                elif verdict == DOWN:
-                    server_down = True
-                hook_log(
-                    "recall_error",
-                    {"scope": scope_list, "error": str(exc)[:200], "verdict": verdict},
-                )
-        finally:
-            # hits = raw count from this scope's call (pre-bucketing/filtering);
-            # elapsed_ms measured around the call, recorded even when it errored.
-            per_scope[scope_list[0]] = {
-                "hits": len(part or []),
-                "elapsed_ms": round((time.monotonic() - t0) * 1000, 1),
-            }
-        if server_down:
-            # Positively absent (refused/DNS): the remaining scopes would fail
-            # the same way in milliseconds each — stop here.
-            hook_log("recall_server_down", {"base_url": service_url})
-            break
-        if auth_rejected:
-            # Every scope shares the same API key, so the remaining scopes are
-            # doomed to the same 401/403 — don't spend the budget on them.
-            hook_log("recall_auth_rejected", {"base_url": service_url})
-            break
+        if isinstance(exc, asyncio.TimeoutError):
+            verdict = SLOW  # pre-3.11 asyncio.TimeoutError isn't TimeoutError
+        else:
+            verdict = classify_transport_exception(exc)
+        if isinstance(exc, _urlerr.HTTPError) and exc.code == 404 and scope_list == ["graph"]:
+            # A dataset nobody has written to yet has no graph, and the
+            # server answers the graph scope with 404 (DatasetNotFound)
+            # until the first cognify lands. On a fresh install that is
+            # every prompt of the first session — expected, not an error:
+            # keep it out of recall_error and the health accounting
+            # (scopes_answered_err) so real failures stay visible (SDK-469).
+            hook_log("recall_graph_not_built", {"scope": scope_list, "dataset": scope_dataset})
+            continue
+        if isinstance(exc, _urlerr.HTTPError):
+            scopes_answered_err += 1
+            if exc.code in (401, 403):
+                auth_rejected = True
+            elif exc.code >= 500:
+                server_errors += 1
+        elif verdict == SLOW:
+            scope_timeouts += 1
+        elif verdict == DOWN:
+            server_down = True
+        hook_log(
+            "recall_error",
+            {"scope": scope_list, "error": str(exc)[:200], "verdict": verdict},
+        )
+    # The scopes were all in flight together, so there is nothing left to cut
+    # short; these mark the prompt-level verdict for the health accounting.
+    if server_down:
+        # Positively absent (refused/DNS): every request failed in milliseconds.
+        hook_log("recall_server_down", {"base_url": service_url})
+    if auth_rejected:
+        # Every scope shares the same API key, so every request drew the same
+        # 401/403.
+        hook_log("recall_auth_rejected", {"base_url": service_url})
 
     # Fold this prompt's recall outcomes back into the shared health state.
     # Best-effort: accounting must never break the keystroke->answer path.
@@ -755,6 +783,7 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
                 "session_totals": _totals,
                 "per_scope": per_scope,
                 "saves_last_turn": saves_last_turn,
+                "elapsed_ms": elapsed_ms(recall_start),
             },
         )
         notify(f"injected context ({counts}); saves last turn {saves_last_turn}")
@@ -778,7 +807,11 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
             full_context = f"{header}\n\n(no memory matches for this prompt)"
             hook_log(
                 "context_lookup_empty",
-                {"per_scope": per_scope, "saves_last_turn": saves_last_turn},
+                {
+                    "per_scope": per_scope,
+                    "saves_last_turn": saves_last_turn,
+                    "elapsed_ms": elapsed_ms(recall_start),
+                },
             )
             notify(f"no recall matches; saves last turn {saves_last_turn}")
 

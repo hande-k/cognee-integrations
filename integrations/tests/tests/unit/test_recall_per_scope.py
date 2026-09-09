@@ -4,16 +4,18 @@ Recall fans out over four scopes (session / trace / session_context / graph) on
 every single prompt, so it is the plugin's most latency-sensitive path. Two things
 have to hold: the record must show what each scope did — including scopes that
 found nothing or never ran — and the fan-out must respect one overall budget
-rather than letting each scope spend a full timeout past the deadline.
+rather than letting any scope run a full timeout past the deadline.
 
 Contract:
   * the event carries a ``{hits, elapsed_ms}`` record for all four scopes, in
-    dispatch order, without disturbing the aggregate ``counts``;
+    canonical order, without disturbing the aggregate ``counts``;
   * per-scope hits are raw attribution — ``graph`` is not folded here, while
     ``counts`` buckets it into ``graph_context``;
   * an open breaker runs nothing yet still reports all four as skipped;
-  * a scope's timeout is clamped to the budget remaining after earlier scopes,
-    and once too little is left the rest are skipped, not dispatched;
+  * the scopes are dispatched concurrently, every one with the same deadline —
+    the per-scope timeout clamped to the whole budget — so the prompt waits for
+    the slowest scope, not the sum, and no scope waits behind another;
+  * a budget too small for any honest attempt dispatches nothing at all;
   * the synchronous prompt hook never drains the warmup buffer.
 
 All registered suites carry this machinery identically (``per_scope``,
@@ -100,15 +102,37 @@ def test_an_open_breaker_skips_every_scope_but_still_reports(lookup, monkeypatch
     assert run.calls == [], f"breaker open must dispatch nothing, got {run.calls}"
 
 
-def test_scope_timeouts_are_clamped_to_the_remaining_budget(lookup, monkeypatch):
-    """The budget is shared, not per scope.
+def test_every_scope_gets_the_same_deadline_clamped_to_the_budget(lookup, monkeypatch):
+    """One deadline for the whole fan-out: min(per-scope timeout, budget).
 
-    With a 0.8s budget and a 0.5s per-call timeout, a slow ``session`` (0.45s)
-    leaves ~0.35s, so ``trace`` must be dispatched with less than the full 0.5s.
-    ``trace`` then burns 0.3s, dropping the remainder below MIN_SCOPE_TIMEOUT, so
-    the last two scopes are skipped outright. Without the clamp each scope could
-    run a full timeout past the deadline — four scopes overrunning a 0.8s budget
-    is a visible stall on every prompt.
+    With a 0.5s per-call timeout and a 0.8s budget every scope gets 0.5s; with a
+    0.3s budget every scope is clamped to ~0.3s. Nobody is handed the budget
+    "remaining after earlier scopes" any more, because nothing runs earlier —
+    all four are in flight together, so the recall can never outlast the
+    smaller of the two knobs.
+    """
+    monkeypatch.setenv("COGNEE_RECALL_TIMEOUT", "0.5")
+    monkeypatch.setenv("COGNEE_RECALL_BUDGET", "0.8")
+    run = drive_recall(lookup, monkeypatch, recall={scope: [] for scope in SCOPES})
+    assert set(run.timeouts) == set(SCOPES), run.timeouts
+    assert all(t == 0.5 for t in run.timeouts.values()), run.timeouts
+
+    monkeypatch.setenv("COGNEE_RECALL_BUDGET", "0.3")
+    run = drive_recall(lookup, monkeypatch, recall={scope: [] for scope in SCOPES})
+    assert set(run.timeouts) == set(SCOPES), run.timeouts
+    assert all(0.2 <= t <= 0.3 for t in run.timeouts.values()), (
+        f"expected every scope clamped to the budget: {run.timeouts}"
+    )
+    assert not run.fired("recall_budget_exceeded"), run.events
+
+
+def test_scopes_run_concurrently_so_the_prompt_waits_for_the_slowest(lookup, monkeypatch):
+    """Two slow scopes (0.45s + 0.3s) must cost ~0.45s, not 0.75s.
+
+    Sequential dispatch made every cheap scope a full round trip on top of the
+    graph search. Concurrent dispatch is the point of the fan-out, so it is
+    pinned by wall time: well under the sum, and every scope still dispatched
+    and reported with its own elapsed time.
     """
     sleeps = {"session": 0.45, "trace": 0.3}
 
@@ -116,22 +140,78 @@ def test_scope_timeouts_are_clamped_to_the_remaining_budget(lookup, monkeypatch)
         time.sleep(sleeps.get(kw["scope"][0], 0))
         return []
 
-    monkeypatch.setenv("COGNEE_RECALL_TIMEOUT", "0.5")
-    monkeypatch.setenv("COGNEE_RECALL_BUDGET", "0.8")
+    monkeypatch.setenv("COGNEE_RECALL_TIMEOUT", "5")
+    monkeypatch.setenv("COGNEE_RECALL_BUDGET", "5")
+    started = time.monotonic()
     run = drive_recall(lookup, monkeypatch, recall=slow_recall)
+    wall = time.monotonic() - started
 
-    # The first scope owns the whole budget, so it gets the full per-call timeout.
-    assert run.timeouts["session"] == 0.5, run.timeouts
-    # The second is clamped to what is left, never the full timeout again.
-    assert 0.2 <= run.timeouts["trace"] < 0.45, f"expected a clamped timeout: {run.timeouts}"
-    # And the rest are never dispatched at all.
-    assert set(run.timeouts) == {"session", "trace"}, run.timeouts
-    assert run.fired("recall_budget_exceeded"), f"budget overrun not logged: {run.events}"
+    assert set(run.calls) == set(SCOPES), run.calls
+    assert wall < 0.65, f"scopes ran back to back: {wall:.2f}s for 0.45s + 0.3s of sleeps"
 
     per_scope = run.detail("context_lookup_empty")["per_scope"]
     assert_valid_per_scope(per_scope)
-    for scope in ("session_context", "graph"):
-        assert per_scope[scope].get("skipped"), f"{scope} should be marked skipped: {per_scope}"
+    assert not any(record.get("skipped") for record in per_scope.values()), per_scope
+    assert per_scope["session"]["elapsed_ms"] >= 400, per_scope
+    assert per_scope["trace"]["elapsed_ms"] >= 250, per_scope
+
+
+def test_a_budget_below_the_floor_dispatches_nothing(lookup, monkeypatch):
+    """Less than MIN_SCOPE_TIMEOUT of budget cannot return anything useful.
+
+    Firing requests with a doomed deadline only loads the server; the hook
+    logs ``recall_budget_exceeded`` and reports every scope as skipped.
+    """
+    monkeypatch.setenv("COGNEE_RECALL_BUDGET", "0.05")
+    run = drive_recall(lookup, monkeypatch, recall={scope: [] for scope in SCOPES})
+
+    assert run.calls == [], f"nothing may be dispatched below the floor: {run.calls}"
+    assert run.fired("recall_budget_exceeded"), f"budget overrun not logged: {run.events}"
+    per_scope = run.detail("context_lookup_empty")["per_scope"]
+    assert_valid_per_scope(per_scope)
+    assert all(record.get("skipped") for record in per_scope.values()), per_scope
+
+
+def test_the_injected_context_is_identical_whatever_order_the_scopes_answer_in(lookup, monkeypatch):
+    """Golden parity: staggered arrivals produce the byte-identical injection.
+
+    The sections are folded in canonical order after the fan-out, so a run where
+    graph answers first and session last must render exactly what an
+    all-instant run renders. The header line is stripped before comparing: it
+    carries per-session running totals that legitimately differ between two
+    consecutive runs on one host.
+    """
+    hits = {
+        "session": [{"question": "q1", "answer": "a1", "time": "t"}],
+        "trace": [{"source": "trace", "origin_function": "Bash", "status": "ok"}],
+        "session_context": [{"source": "session_context", "content": "standing guidance"}],
+        "graph": [{"source": "graph", "content": "graph fact"}],
+    }
+    delays = {"session": 0.3, "trace": 0.2, "session_context": 0.1, "graph": 0.0}
+
+    def staggered(_prompt, **kw):
+        scope = kw["scope"][0]
+        time.sleep(delays[scope])
+        return list(hits[scope])
+
+    def body(run) -> str:
+        text = run.output["hookSpecificOutput"]["additionalContext"]
+        return text.split("\n", 1)[1]
+
+    instant = drive_recall(lookup, monkeypatch, recall=hits)
+    shuffled = drive_recall(lookup, monkeypatch, recall=staggered)
+
+    assert body(shuffled) == body(instant)
+    context = body(shuffled)
+    positions = [
+        context.index("=== Active agent guidance ==="),
+        context.index("=== Knowledge graph snapshot ==="),
+        context.index("=== Prior agent trace ==="),
+        context.index("=== Prior session turns ==="),
+    ]
+    assert positions == sorted(positions), context
+    for needle in ("standing guidance", "graph fact", "[trace] Bash — ok", "Q: q1"):
+        assert needle in context, context
 
 
 def test_the_prompt_hook_does_not_drain_the_warmup_buffer(lookup):

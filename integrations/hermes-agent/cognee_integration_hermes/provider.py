@@ -963,15 +963,17 @@ class CogneeMemoryProvider(MemoryProvider):
         return scope == ["graph"] and getattr(exc, "status", None) == 404
 
     def _run_layered_prefetch(self, query: str, session_id: str, generation: int) -> None:
-        """Fan recall out over the memory layers, cheap scopes first.
+        """Fan recall out over the memory layers, all lanes at once.
 
         With ``dataset_ids`` + ``search_type`` in a single request the server's
         ``auto`` scope resolves graph-only, so cached Q&A turns, trace lessons
         and distilled agent guidance never reached the prompt. One bounded call
         per scope instead, each rendered as its own labelled block; a failure in
-        one lane never discards the others. The graph lane runs last — it is the
-        only call that can consume a full per-call timeout, and running it
-        earlier starves the cheap lanes out of the budget.
+        one lane never discards the others. The lanes are dispatched
+        concurrently with one shared deadline, so the prefetch costs the slowest
+        lane (graph) rather than the sum — sequentially, every cheap lane was a
+        full round trip on top of the graph search, and the code lane could burn
+        seconds before graph even started.
         """
         budget = self._config.get("recall_budget")
         deadline = time.monotonic() + (20.0 if budget is None else float(budget))
@@ -1002,17 +1004,16 @@ class CogneeMemoryProvider(MemoryProvider):
             ("graph_memory", {"scope": ["graph"], "query_type": "HYBRID_COMPLETION"}, True)
         )
 
-        blocks: list[str] = []
-        hits = 0
-        cross = 0
-        answered = False
-        hard_failures = 0
-        for label, spec, is_cross in lanes:
-            remaining = deadline - time.monotonic()
-            if remaining < 0.2:
-                # Not enough budget left for an honest attempt; skipping beats
-                # firing a request with a doomed deadline.
-                break
+        # Same deadline for every lane: min(per-call timeout, budget left).
+        # Below the floor a call cannot return anything useful, so nothing is
+        # dispatched rather than firing requests with a doomed deadline.
+        remaining = deadline - time.monotonic()
+        if remaining < 0.2:
+            lanes = []
+        lane_timeout = min(recall_timeout, max(remaining, 0.0))
+
+        def _run_lane(spec: dict[str, Any]) -> tuple[Any, Optional[Exception]]:
+            """One lane's call; never raises, so no lane can take down the rest."""
             try:
                 results = self._backend.recall(
                     query=query,
@@ -1025,16 +1026,39 @@ class CogneeMemoryProvider(MemoryProvider):
                     context_profile=spec.get("context_profile"),
                     code_query=spec.get("code_query"),
                     only_context=True,
-                    timeout=min(recall_timeout, remaining),
+                    timeout=lane_timeout,
                 )
-                answered = True
             except Exception as exc:
+                return None, exc
+            return results, None
+
+        outcomes: list[tuple[Any, Optional[Exception]]] = []
+        if lanes:
+            # One worker per lane. The HTTP backend blocks on its socket; the
+            # SDK backend hands every call to its single dedicated event loop,
+            # where the lanes interleave as coroutines. Each call bounds itself
+            # with ``lane_timeout``, so the pool joins within the budget.
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(lanes), thread_name_prefix="cognee-recall-lane"
+            ) as pool:
+                outcomes = list(pool.map(_run_lane, [spec for _label, spec, _cross in lanes]))
+
+        blocks: list[str] = []
+        hits = 0
+        cross = 0
+        answered = False
+        hard_failures = 0
+        # Fold the lanes in canonical order so the rendered blocks read the same
+        # whichever request answered first.
+        for (label, spec, is_cross), (results, exc) in zip(lanes, outcomes):
+            if exc is not None:
                 if self._is_graph_not_built(exc, spec["scope"]):
                     answered = True
                     continue
                 hard_failures += 1
                 logger.debug("Cognee recall lane %s failed: %s", label, exc)
                 continue
+            answered = True
             lines = self._format_recall_lines(results, limit=top_k)
             if not lines:
                 continue

@@ -10,6 +10,28 @@ Code only offers an update when that string changes. Tag releases as
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.4]
+
+### Changed
+- **Per-prompt recall dispatches every scope at once.** The scopes (`session`,
+  `trace`, `session_context`, `graph`, plus the `code` lane when it is armed)
+  were requested one after another, so every cheap scope was a full round trip
+  on top of the graph search — three of them against a cloud server — and an
+  armed code lane could burn seconds before graph even started. All scopes are
+  now in flight together and the prompt waits for the slowest one, not the sum;
+  the results are folded into the same injected context, in the same order.
+  With the graph search the only expensive call, a prompt's recall now costs
+  about what the graph search alone costs.
+  - `COGNEE_RECALL_TIMEOUT` and `COGNEE_RECALL_BUDGET` keep their defaults
+    (10s per scope, 12s overall), but every scope now gets the same deadline — the smaller of
+    the two — instead of whatever earlier scopes left over. `recall_budget_exceeded`
+    fires only when the budget is too small for any request at all.
+  - A refused connection or a 401/403 no longer cuts the fan-out short (every
+    request is already in flight and fails in the same round trip); it is still
+    recorded as one verdict per prompt, never one per scope.
+  - `per_scope` in the `context_lookup_*` events keeps its canonical order and
+    per-scope `elapsed_ms`, which now overlap rather than add up.
+
 ## [1.5.3]
 
 ### Fixed

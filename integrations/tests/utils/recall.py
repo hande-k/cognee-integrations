@@ -22,9 +22,11 @@ import types
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-#: The scopes ``_run`` fans out over, in dispatch order. The optional ``code``
-#: lane is inserted before ``graph`` only on prompts that arm it, so it is not
-#: part of the always-present set.
+#: The scopes ``_run`` fans out over, in canonical (reporting) order. The
+#: scopes are dispatched concurrently, so this is the order of ``per_scope`` and
+#: of the injected sections, not an order of calls. The optional ``code`` lane
+#: is added only on prompts that arm it, so it is not part of the always-present
+#: set.
 SCOPES = ("session", "trace", "session_context", "graph")
 
 #: Base URL every driven run resolves to. Health state is keyed by service URL
@@ -47,7 +49,9 @@ class RecallRun:
     writes: list[tuple[str, str, str]] = field(default_factory=list)
     #: ``("success", url)`` / ``("failure", url, reason)`` breaker accounting.
     breaker: list[tuple] = field(default_factory=list)
-    #: Scope names actually dispatched — the length is how much budget was spent.
+    #: Scope names actually dispatched. The scopes run concurrently (each call
+    #: lands here from its own worker thread), so the ORDER of this list is not
+    #: meaningful — assert on membership and length.
     calls: list[str] = field(default_factory=list)
     #: ``{scope: timeout}`` as handed to ``recall_via_http``, for budget clamping.
     timeouts: dict[str, float] = field(default_factory=dict)
@@ -80,16 +84,32 @@ def drive_recall(
     slow_streak: int = 1,
     slow_threshold: int = 3,
     cwd: str = "",
+    mode: str = "http",
+    sdk_recall: Callable[..., Any] | dict[str, list] | None = None,
 ) -> RecallRun:
-    """Run ``module._run(prompt)`` in cloud mode with every seam captured.
+    """Run ``module._run(prompt)`` with every seam captured.
 
     ``recall`` is either a callable used as ``recall_via_http``, or a
     ``{scope: results}`` map for the common case of fixed per-scope results.
     ``prior_state``/``ready_hint`` set what the hook believes about the server
     before the attempt; ``slow_streak``/``slow_threshold`` drive timeout
     escalation without touching real streak files.
+
+    ``mode="http"`` (the default) drives cloud/HTTP mode, the only mode where
+    the health accounting runs. ``mode="local_sdk"`` drives the in-process SDK
+    branch of suites that still carry one (``Suite.has_local_sdk_recall``): a
+    fake ``cognee`` package is installed whose ``recall`` coroutine is
+    ``sdk_recall`` — an ``async`` callable ``(prompt, **kwargs)`` or a
+    ``{scope: results}`` map — and the local-only seams (readiness, user
+    resolution, the trace fallback and the dim-mismatch probe) are stubbed to
+    no-ops so the test sees the fan-out alone. Calls land in ``run.calls`` /
+    ``run.kwargs`` either way; ``run.timeouts`` is HTTP-only, because the SDK
+    branch bounds each call with ``asyncio.wait_for`` rather than a kwarg.
     """
     run = RecallRun()
+    local_sdk = mode == "local_sdk"
+    if mode not in ("http", "local_sdk"):
+        raise ValueError(f"unknown drive_recall mode: {mode!r}")
 
     if recall is None:
         recall = {}
@@ -102,6 +122,8 @@ def drive_recall(
         _recall_fn = recall
 
     def _recall(prompt_arg, **kw):
+        # Called from the hook's worker threads, one per scope. list.append and
+        # dict item assignment are atomic under the GIL, so no lock is needed.
         scope = kw["scope"][0]
         run.calls.append(scope)
         if "timeout" in kw:
@@ -113,7 +135,11 @@ def drive_recall(
         "hook_log": lambda event, detail=None: run.events.append((event, detail or {})),
         "notify": lambda *a, **k: None,
         "load_config": lambda: {},
-        "resolve_runtime_mode": lambda: {"mode": "http", "base_url": URL},
+        "resolve_runtime_mode": (
+            (lambda: {"mode": "local_sdk", "base_url": ""})
+            if local_sdk
+            else (lambda: {"mode": "http", "base_url": URL})
+        ),
         "read_connection_state": lambda: dict(prior_state or {}),
         "server_ready_hint": lambda url: ready_hint,
         "mark_server_ready": lambda url: run.writes.append(("ready", url, "")),
@@ -130,6 +156,9 @@ def drive_recall(
     for name, impl in seams.items():
         monkeypatch.setattr(module, name, impl)
 
+    if local_sdk:
+        _install_local_sdk(module, monkeypatch, run, sdk_recall)
+
     # ``_run`` imports the breaker lazily in cloud mode, so a fake in sys.modules
     # shadows the real one and keeps on-disk breaker state out of the test.
     fake_client = types.ModuleType("_cognee_client")
@@ -144,8 +173,73 @@ def drive_recall(
     return run
 
 
+async def _noop_async(*_args, **_kwargs):
+    return None
+
+
+async def _empty_async(*_args, **_kwargs):
+    return []
+
+
+def _install_local_sdk(module, monkeypatch, run: RecallRun, sdk_recall) -> None:
+    """Stub the local-SDK seams and install a fake ``cognee`` for ``_run``.
+
+    The hook imports ``cognee`` and ``cognee.modules.search.types.SearchType``
+    lazily inside ``_run``, so entries in ``sys.modules`` are what it sees. The
+    recorded ``scope`` is the first element of the ``scope`` kwarg, matching the
+    HTTP driver, so ``run.calls`` reads the same in both modes.
+    """
+    if sdk_recall is None:
+        sdk_recall = {}
+    if isinstance(sdk_recall, dict):
+        fixed = sdk_recall
+
+        async def _sdk_fn(_prompt, **kw):
+            return list(fixed.get(kw["scope"][0], []))
+    else:
+        _sdk_fn = sdk_recall
+
+    async def _cognee_recall(prompt_arg, **kw):
+        scope = kw["scope"][0]
+        run.calls.append(scope)
+        run.kwargs[scope] = dict(kw)
+        return await _sdk_fn(prompt_arg, **kw)
+
+    # Local-only seams. ``raising=True`` on purpose: a suite that claims the
+    # local-SDK capability must carry every one of these.
+    for name, impl in {
+        "ensure_cognee_ready": _noop_async,
+        "resolve_user": _noop_async,
+        "_load_user_id": lambda: "user-1",
+        "_recent_trace_fallback": _empty_async,
+        "service_url_is_local": lambda url="": False,
+        "bounded_dim_mismatch_hint": _noop_async,
+    }.items():
+        monkeypatch.setattr(module, name, impl)
+
+    search_types = types.SimpleNamespace(
+        HYBRID_COMPLETION="HYBRID_COMPLETION", GRAPH_COMPLETION="GRAPH_COMPLETION"
+    )
+    cognee = types.ModuleType("cognee")
+    cognee.recall = _cognee_recall
+    cognee_modules = types.ModuleType("cognee.modules")
+    cognee_search = types.ModuleType("cognee.modules.search")
+    cognee_types = types.ModuleType("cognee.modules.search.types")
+    cognee_types.SearchType = search_types
+    cognee.modules = cognee_modules
+    cognee_modules.search = cognee_search
+    cognee_search.types = cognee_types
+    for name, mod in {
+        "cognee": cognee,
+        "cognee.modules": cognee_modules,
+        "cognee.modules.search": cognee_search,
+        "cognee.modules.search.types": cognee_types,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+
+
 def assert_valid_per_scope(per_scope: dict) -> None:
-    """Every scope reports, in dispatch order, with a numeric non-negative time.
+    """Every scope reports, in canonical order, with a numeric non-negative time.
 
     A scope missing from the breakdown is the failure this guards: the point of
     per-scope instrumentation is that a scope which returned nothing or never ran

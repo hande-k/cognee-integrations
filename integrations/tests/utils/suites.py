@@ -60,10 +60,6 @@ class Suite:
     #: async hooks entirely and has no StopFailure, so its entry must be a plain
     #: sync Stop hook with a tight timeout.
     has_async_hooks: bool
-    #: Capability: logs an *aggregate* ``elapsed_ms`` on the ``context_lookup_*``
-    #: events. ``per_scope[*]["elapsed_ms"]`` is present on all registered suites
-    #: while the per-prompt total is claude-code only.
-    has_recall_latency_metric: bool
     #: Capability: renders a rich terminal status bar — the health glyphs, the
     #: recall-counts diagnostics strip, the mode word and the plugin-install
     #: registry. codex instead emits a short plain-text line injected into the
@@ -94,6 +90,12 @@ class Suite:
     #: runs no "shutdown" improve when stopped. Antigravity still carries the
     #: lock, the 15s busy loop, the poll and the shutdown flush.
     has_single_submit_improve: bool
+    #: Capability: ``session-context-lookup.py`` still carries an in-process
+    #: local-SDK recall branch (``cognee.recall`` awaited directly when no service
+    #: URL is configured) next to the HTTP one. claude-code and codex dropped it
+    #: (PR #405 / "delete old local SDK mode"); Antigravity keeps it, so its
+    #: concurrent fan-out has two dispatch paths to pin, not one.
+    has_local_sdk_recall: bool
 
 
 CLAUDE = Suite(
@@ -110,10 +112,10 @@ CLAUDE = Suite(
     session_suffix="_claude",
     host_stem="claude",
     has_async_hooks=True,
-    has_recall_latency_metric=True,
     has_rich_statusline=True,
     has_precompact_http=True,
     has_single_submit_improve=True,
+    has_local_sdk_recall=False,
 )
 
 CODEX = Suite(
@@ -135,10 +137,10 @@ CODEX = Suite(
     session_suffix="_codex",
     host_stem="codex",
     has_async_hooks=False,
-    has_recall_latency_metric=False,
     has_rich_statusline=False,
     has_precompact_http=True,
     has_single_submit_improve=True,
+    has_local_sdk_recall=False,
 )
 
 ANTIGRAVITY = Suite(
@@ -154,11 +156,11 @@ ANTIGRAVITY = Suite(
     session_suffix="_agy",
     host_stem="agy",
     has_async_hooks=False,
-    has_recall_latency_metric=False,
     has_rich_statusline=False,
     has_precompact_http=True,
     hook_manifest_style="named",
     has_single_submit_improve=False,
+    has_local_sdk_recall=True,
 )
 
 ALL_SUITES = [CLAUDE, CODEX, ANTIGRAVITY]

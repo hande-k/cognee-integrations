@@ -13,13 +13,12 @@ Contract:
 (The legacy document bridge's ``http_bridge_poll`` / failed-submit timings used
 to be pinned here too; that bridge is gone.)
 
-Gated by capability rather than by probe, and the two halves differ:
-
-* the **helper** half runs on all registered suites — codex gained ``elapsed_ms`` in the
-  port that landed in main;
-* the **recall** half stays claude-code only: codex logs no aggregate per-prompt
-  total, timing each scope inline instead. That per-scope breakdown is asserted
-  for all registered suites in test_recall_per_scope.py.
+Both halves run on every registered suite. The aggregate per-prompt total was
+claude-code only until the recall scopes were dispatched concurrently: with the
+per-scope timings overlapping instead of adding up, the total stopped being
+derivable from ``per_scope`` alone, so codex and antigravity now log it too (the
+``has_recall_latency_metric`` flag was retired with that port). The per-scope
+breakdown is asserted for all registered suites in test_recall_per_scope.py.
 
 Migrated from claude-code/tests/test_hook_timing.py, which ran in no CI job on any
 platform.
@@ -40,8 +39,6 @@ def pc(suite, isolated_modules):
 
 @pytest.fixture
 def lookup(suite, hook_module):
-    if not suite.has_recall_latency_metric:
-        pytest.skip(f"{suite.name}: context_lookup events carry no aggregate elapsed_ms")
     return hook_module(suite, "session-context-lookup.py")
 
 
@@ -91,3 +88,26 @@ def test_a_recall_miss_carries_its_elapsed_ms(lookup, monkeypatch):
     assert detail is not None, f"expected a context_lookup_empty: {run.events}"
     assert isinstance(detail.get("elapsed_ms"), int), detail
     assert detail["elapsed_ms"] >= 0
+
+
+def test_the_aggregate_is_the_fan_out_wall_time_not_the_sum_of_scopes(lookup, monkeypatch):
+    """Scopes overlap, so the total tracks the slowest scope, not their sum.
+
+    This is the reason every suite now carries the aggregate: two scopes of
+    0.3s dispatched together cost ~0.3s, and only the aggregate can say so —
+    summing ``per_scope`` reads ~0.6s.
+    """
+    sleeps = {"session": 0.3, "trace": 0.3}
+
+    def slow(_prompt, **kw):
+        time.sleep(sleeps.get(kw["scope"][0], 0))
+        return []
+
+    monkeypatch.setenv("COGNEE_RECALL_TIMEOUT", "5")
+    monkeypatch.setenv("COGNEE_RECALL_BUDGET", "5")
+    run = drive_recall(lookup, monkeypatch, recall=slow)
+
+    detail = run.detail("context_lookup_empty")
+    summed = sum(r["elapsed_ms"] for r in detail["per_scope"].values())
+    assert summed >= 550, detail["per_scope"]
+    assert 250 <= detail["elapsed_ms"] < 500, (detail["elapsed_ms"], detail["per_scope"])

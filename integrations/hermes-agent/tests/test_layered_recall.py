@@ -3,11 +3,14 @@
 With ``dataset_ids`` + ``search_type`` in a single request the server's
 ``auto`` scope resolves graph-only, so cached Q&A turns, trace lessons and
 distilled agent guidance never reached the prompt. The layered fan-out runs
-one bounded call per scope, cheap lanes first, and renders each layer as its
-own labelled block. Run standalone with ``python3 tests/test_layered_recall.py``.
+one bounded call per scope, all lanes dispatched concurrently under one shared
+deadline, and renders each layer as its own labelled block in canonical
+order. Run standalone with ``python3 tests/test_layered_recall.py``.
 """
 
+import asyncio
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -15,7 +18,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from _char_helpers import fake_backend, make_provider  # noqa: E402
+from _char_helpers import fake_backend, fake_cognee, make_provider  # noqa: E402
+from cognee_integration_hermes.backend import SdkBackend  # noqa: E402
 
 _LAYERED = {"recall_session_layers": True, "recall_budget": 20}
 
@@ -33,12 +37,61 @@ def _prefetch(provider, query="q"):
 
 
 class TestLayeredFanOut(unittest.TestCase):
-    def test_one_call_per_scope_cheap_lanes_first(self):
+    def test_one_call_per_scope(self):
         with fake_backend() as fake:
             provider = make_provider(config=_LAYERED)
             _prefetch(provider)
-            scopes = [kwargs["scope"] for kwargs in fake.kwargs_for("recall")]
-        self.assertEqual(scopes, [["session"], ["trace"], ["session_context"], ["graph"]])
+            scopes = sorted(tuple(kwargs["scope"]) for kwargs in fake.kwargs_for("recall"))
+        # Dispatched concurrently, so only the set of lanes is pinned, not an order.
+        self.assertEqual(
+            scopes, sorted([("session",), ("trace",), ("session_context",), ("graph",)])
+        )
+
+    def test_lanes_run_concurrently_under_one_deadline(self):
+        # Four lanes sleeping 0.3s each must cost ~0.3s, not 1.2s, and every lane
+        # must be handed the same deadline: min(recall_timeout, budget).
+        with fake_backend() as fake:
+            original = fake.recall
+
+            def slow(**kwargs):
+                time.sleep(0.3)
+                return original(**kwargs)
+
+            fake.recall = slow
+            provider = make_provider(config={**_LAYERED, "recall_timeout": 5, "recall_budget": 2})
+            started = time.monotonic()
+            _prefetch(provider)
+            wall = time.monotonic() - started
+            timeouts = {kwargs["timeout"] for kwargs in fake.kwargs_for("recall")}
+        self.assertEqual(len(fake.kwargs_for("recall")), 4)
+        self.assertLess(wall, 0.9, f"lanes ran back to back: {wall:.2f}s for 4 x 0.3s")
+        self.assertEqual(len(timeouts), 1, timeouts)
+        self.assertLessEqual(max(timeouts), 2.0)
+        self.assertGreater(max(timeouts), 1.5)
+
+    def test_blocks_are_rendered_in_canonical_order_whatever_answers_first(self):
+        with fake_backend() as fake:
+            original = fake.recall
+            delays = {
+                ("session",): 0.25,
+                ("trace",): 0.15,
+                ("session_context",): 0.05,
+                ("graph",): 0.0,
+            }
+
+            def staggered(**kwargs):
+                time.sleep(delays[tuple(kwargs["scope"])])
+                original(**kwargs)
+                return [{"text": f"from {kwargs['scope'][0]}"}]
+
+            fake.recall = staggered
+            provider = make_provider(config={**_LAYERED, "memory_hits": False})
+            out = _prefetch(provider)
+        order = [
+            out.index(tag)
+            for tag in ("<session_memory>", "<trace_lessons>", "<agent_guidance>", "<graph_memory>")
+        ]
+        self.assertEqual(order, sorted(order), out)
 
     def test_graph_lane_uses_hybrid_completion_and_only_context(self):
         with fake_backend() as fake:
@@ -126,6 +179,69 @@ class TestLayeredFanOut(unittest.TestCase):
             provider = make_provider(config={**_LAYERED, "recall_budget": 0})
             _prefetch(provider)
             self.assertEqual(fake.kwargs_for("recall"), [])
+
+
+class TestSdkBackendLanes(unittest.TestCase):
+    """The lanes through the in-process SDK transport.
+
+    ``SdkBackend`` hands every call to one dedicated event loop and waits on
+    ``future.result(timeout)``. Four lanes submitted from four pool threads must
+    interleave as coroutines on that loop — not queue behind each other — and a
+    lane that outlives its deadline must fail alone while the loop keeps
+    serving the others.
+    """
+
+    def _sdk_provider(self, config=None):
+        backend = SdkBackend()
+        provider = make_provider(backend=backend, config={**_LAYERED, **(config or {})})
+        return backend, provider
+
+    def test_lanes_interleave_on_the_single_sdk_loop(self):
+        with fake_cognee() as fake:
+            original = fake.recall
+
+            async def slow(**kwargs):
+                await asyncio.sleep(0.3)
+                return await original(**kwargs)
+
+            sys.modules["cognee"].recall = slow
+            backend, provider = self._sdk_provider()
+            try:
+                started = time.monotonic()
+                _prefetch(provider)
+                wall = time.monotonic() - started
+                calls = fake.kwargs_for("recall")
+            finally:
+                backend.close(unregister=False)
+        self.assertEqual(len(calls), 4, calls)
+        self.assertLess(wall, 0.9, f"lanes queued behind each other on the loop: {wall:.2f}s")
+
+    def test_a_lane_past_its_deadline_fails_alone(self):
+        with fake_cognee() as fake:
+            original = fake.recall
+
+            async def one_hangs(**kwargs):
+                # The graph lane is the only one that names a search type (the
+                # SDK transport maps it onto whatever SearchType the installed
+                # cognee has); the session lanes pass None.
+                if kwargs.get("query_type") is not None:
+                    await asyncio.sleep(3)
+                await original(**kwargs)
+                return [{"text": f"from {kwargs.get('query_type')}"}]
+
+            sys.modules["cognee"].recall = one_hangs
+            backend, provider = self._sdk_provider({"recall_timeout": 0.5, "memory_hits": False})
+            try:
+                started = time.monotonic()
+                out = _prefetch(provider)
+                wall = time.monotonic() - started
+            finally:
+                backend.close(unregister=False)
+        self.assertLess(wall, 1.5, f"the hung lane held the prefetch: {wall:.2f}s")
+        self.assertIn("<session_memory>", out)
+        self.assertNotIn("<graph_memory>", out)
+        # One lane timing out while three answered is proof of life, not failure.
+        self.assertEqual(provider._consecutive_failures, 0)
 
 
 class TestCodeLane(unittest.TestCase):
