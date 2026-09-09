@@ -16,7 +16,6 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `exit-watcher:connection_reprobe_error` | `exit_watcher.connection_reprobe_error` |
 | `exit-watcher:connection_reprobe_no_heal` | `exit_watcher.connection_reprobe_no_heal` |
 | `exit-watcher:connection_self_healed` | `exit_watcher.connection_self_healed` |
-| `exit-watcher:credits_check_error` | `exit_watcher.credits_check_error` |
 | `exit-watcher:exit_sync_deferred` | `exit_watcher.exit_sync_deferred` |
 | `exit-watcher:exit_sync_detach_failed` | `exit_watcher.exit_sync_detach_failed` |
 | `exit-watcher:exit_target_resolve_failed` | `exit_watcher.exit_target_resolve_failed` |
