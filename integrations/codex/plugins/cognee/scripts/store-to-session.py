@@ -35,7 +35,7 @@ from _plugin_common import (
     remember_entry_via_http,
     resolve_runtime_mode,
     resolve_session_key_from_payload,
-    run_session_improve,
+    run_session_improve_detailed,
     server_usable,
     set_session_key,
     touch_activity,
@@ -53,7 +53,7 @@ async def _fire_improve_background(dataset: str, session_id: str, reason: str) -
     """Fire-and-forget session improve; failures are logged but never raised.
 
     The server bridges the session itself from its session cache (improve);
-    see run_session_improve. Shares the cooldown / no-new-entries gate with the
+    see run_session_improve_detailed. Shares the cooldown / backoff gate with the
     idle watcher; the session-end sync ignores it and covers whatever a skip
     here leaves behind. Without server auth there is nothing to submit to —
     the session-end sync picks the session up once a key is available.
@@ -69,10 +69,17 @@ async def _fire_improve_background(dataset: str, session_id: str, reason: str) -
         if not http_api_ready():
             hook_log("auto_improve_skipped_no_auth", {"reason": reason, "session": session_id})
             return
-        wrote = run_session_improve(dataset, session_id, trigger="auto")
+        outcome = run_session_improve_detailed(dataset, session_id, trigger="auto")
+        wrote = bool(outcome.get("ok"))
         hook_log(
             "auto_improve_fired",
-            {"reason": reason, "session": session_id, "via": "http_improve", "wrote": wrote},
+            {
+                "reason": reason,
+                "session": session_id,
+                "via": "http_improve",
+                "wrote": wrote,
+                "outcome": str(outcome.get("reason") or ""),
+            },
         )
         if wrote:
             notify(f"session improve submitted ({reason})")

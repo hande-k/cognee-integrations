@@ -59,25 +59,24 @@ Divergences are named by a declared flag on `Suite`, never inferred from
 
 | Flag | `claude-code` | `codex` | `antigravity` | Gates |
 |---|---|---|---|---|
-| `has_background_remember` | `True` | `True` | `True` | background bridge, `{"ok": ...}` envelope, `wait_for_cognify`, bounded `do_remember` wait |
-| `has_improve_pipeline_polling` | `True` | `True` | `True` | `improve_session_via_http` reports `cognify_status`/`memify_status` |
 | `has_async_hooks` | `True` | `False` | `False` | `async` hook entries + `StopFailure` in `hooks.json` |
-| `has_elapsed_ms_helper` | `True` | `True` | `True` | `_plugin_common.elapsed_ms`, and `elapsed_ms` on the bridge events |
 | `has_recall_latency_metric` | `True` | `False` | `False` | aggregate `elapsed_ms` on `context_lookup_*` |
 | `has_rich_statusline` | `True` | `False` | `False` | health glyphs, recall-counts strip, mode word, install registry |
 | `has_precompact_http` | `False` | `True` | `True` | `pre-compact.py` recalls over HTTP |
+| `has_single_submit_improve` | `True` | `True` | `False` | one improve submit per trigger (SDK-594): no plugin-side improve lock, no busy re-submit, no post-improve status poll, failure backoff, `run_session_improve_detailed`, no shutdown improve in the idle watcher |
 | `host_stem` | `claude` | `codex` | `agy` | `_proc`'s Windows ancestry match |
 
-`has_background_remember` was `False` for codex until the refactor was ported in
-main; **39 codex tests started passing the moment the flag flipped**, with no test
-edits, which is the payoff for gating on a capability rather than a suite name.
+A flag is retired once every registered suite agrees on it. `has_background_remember`,
+`has_improve_pipeline_polling` and `has_elapsed_ms_helper` were all `True` everywhere
+and gated nothing, so they are gone; `has_single_submit_improve` goes the same way
+once Antigravity is ported.
 
-Two lessons from that flip, both worth keeping:
+Two lessons from the `has_background_remember` flip that made codex pass 39 tests
+with no test edits, both worth keeping:
 
-- **The port was partial.** It covered the bridge, `wait_for_cognify` and the
-  bounded `do_remember` wait, but not the improve path — hence
-  `has_improve_pipeline_polling`. One flag covering four behaviours hid the fact
-  that they could travel separately.
+- **Ports can be partial.** That one covered the bridge and the bounded
+  `do_remember` wait but not the improve path, so it needed a second flag. One
+  flag covering four behaviours hid the fact that they could travel separately.
 - **A flag used as a proxy for a suite name is a latent bug.** A status-line test
   branched on `if suite.has_background_remember:  # claude-code` to assert
   claude-only `hooks.json` wiring. When the flag flipped for codex the branch fired

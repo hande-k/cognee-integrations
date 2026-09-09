@@ -10,6 +10,68 @@ is the cache key and semver record, bumped on each release, not the update trigg
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.3]
+
+### Fixed
+- **One improve per trigger, and no improve at all on the idle watcher's way
+  out.** Three things multiplied improve submits — and every submit is
+  recorded by the server as an improve operation, whether or not it did any
+  work:
+  - The idle watcher ran a last "shutdown" improve when it was stopped by the
+    SessionEnd hook, whenever anything had happened since its previous improve
+    (after a Stop hook: always). The SessionEnd sync that stops it spawns the
+    session's final improve itself, and the exit watcher spawns the same worker
+    when the host dies without a SessionEnd, so the flush only ever collided
+    with the final sync. Removed; `shutdown_trigger` / `shutdown_bridge_*` events
+    are gone.
+  - A busy answer from the server (its per-session improve lock held by another
+    run) was re-submitted every 15 s for up to ten minutes, and the final sync
+    then retried that whole loop three times. In one local log that was 13,915
+    busy re-submits against 1,819 real improves, and one session accumulated
+    ~640 submits over three days with no successful bridge. Repeated and
+    parallel improves are safe server-side — every stage is guarded by a
+    per-session watermark or dedups by content hash — so waiting on the lock
+    bought nothing: the in-flight run persists everything above the watermark
+    and the next trigger covers the rest. A busy answer is now reported and
+    left alone. The final sync logs it as `sync_bridge_deferred_busy` and no
+    longer counts it as incomplete, so its strict retries fire only for
+    transport failures, timed-out submits and undelivered warmup entries.
+    `COGNEE_IMPROVE_BUSY_DEADLINE` and `COGNEE_IMPROVE_BUSY_RETRY_INTERVAL` are
+    gone.
+  - The plugin's own machine-wide per-session improve lock (`improve-locks/`),
+    which existed only to pre-empt that busy loop, is removed with it; the
+    `improve_lock_*` / `improve_skipped_concurrent` events are gone and the
+    state sweep removes the leftover directory.
+- **A failed improve now arms the cooldown too.** Only a success used to write
+  the per-session improve state, so a server that was busy, slow or down was
+  re-submitted after every 60-second pause. Any attempt that does not land
+  (busy, timed out, unreachable, HTTP error) stamps `last_failed_at`, and the
+  idle/auto triggers honour it as a `backoff` for `COGNEE_IMPROVE_COOLDOWN`
+  seconds. The session-end, manual and dataset-switch syncs still always run.
+
+- **A failed idle improve no longer disables the watcher for the rest of the
+  session.** The idle watcher used to set a process-local flag after one
+  failed attempt and keep polling without ever improving again, while its
+  liveness stopped the next prompt from respawning it. It now exits after one
+  attempt, landed or not (`bridge_done` / `bridge_failed`), so the next prompt
+  respawns it and the failure backoff decides when it tries again.
+  `bridge_disabled_after_failure` is gone.
+
+### Changed
+- **Pipeline-status polling after an improve submit is gone.** It was
+  observability only (it never changed the outcome) and cost one
+  `GET /datasets/status` every 3 s for up to ten minutes per improve.
+  `COGNEE_IMPROVE_POLL_DEADLINE` and `_plugin_common.wait_for_cognify` are
+  removed; the remember path keeps its own bounded poll.
+- **One default for the improve submit timeout.** `COGNEE_IMPROVE_SUBMIT_TIMEOUT`
+  now has a single source of truth (`IMPROVE_SUBMIT_TIMEOUT_DEFAULT_SECONDS`,
+  420 s) instead of an import-time environment default, a function fallback and
+  a README value that disagreed. For Codex this raises the effective default from 180 s to 420 s, the value Claude Code has used since the same diagnosis.
+- `run_session_improve` is replaced by `run_session_improve_detailed`, which
+  returns `{"ok", "reason", "error"}` with `reason` one of `busy`,
+  `unreachable`, `incomplete_drain` or `failed`, so callers can tell "someone
+  else is bridging" from "nothing was bridged".
+
 ## [1.6.2]
 
 ### Changed

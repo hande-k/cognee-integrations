@@ -8,9 +8,16 @@ process — it reads the per-session improve state through
   * throttled -> no improve, and the watcher keeps polling rather than exiting,
     so a quiet stretch that outlasts the cooldown still gets its one bridge;
   * not throttled -> exactly one improve, then exit with ``bridge_complete``;
+    on ``has_single_submit_improve`` suites a FAILED improve also exits (with
+    ``bridge_failed``) so the next prompt respawns the watcher and the improve
+    backoff decides when it tries again — the others set a process-local flag
+    and keep polling without ever improving again;
   * the watcher never records improve state itself (the improve functions do,
     on a confirmed success — the watcher cannot tell a lock-refused run apart);
-  * the shutdown bridge runs only when activity is newer than the last improve.
+  * suites without ``has_single_submit_improve``: the shutdown bridge runs only
+    when activity is newer than the last improve; suites with it (claude-code 1.5.3,
+    codex 1.6.3, SDK-594) never improve on the way out — the SessionEnd sync
+    that stops the watcher runs the final improve itself.
 
 The loop is driven with a tiny poll interval and every I/O seam patched; the
 watcher is loaded before ``_plugin_common`` so its function-local imports bind
@@ -115,7 +122,7 @@ def test_bridges_once_the_cooldown_expires(harness, monkeypatch):
     assert reasons == ["cooldown", "no_new_entries"], "one log line per reason change"
 
 
-def test_failed_bridge_disables_further_attempts(harness, monkeypatch):
+def test_failed_bridge_is_one_attempt(harness, suite, monkeypatch):
     watcher, pc, events, improves, run, exit_reason = harness
     monkeypatch.setattr(pc, "improve_throttle_reason", lambda sid: "")
 
@@ -128,13 +135,23 @@ def test_failed_bridge_disables_further_attempts(harness, monkeypatch):
 
     asyncio.run(run(stop_after=0.1))
 
-    assert improves == [("sid", "ds")]  # one attempt, then bridge_disabled
-    assert any(ev == "bridge_disabled_after_failure" for ev, _ in events)
+    assert improves == [("sid", "ds")], "exactly one attempt"
     assert not any(ev == "shutdown_trigger" for ev, _ in events)
+    if suite.has_single_submit_improve:
+        # Exit so the next prompt respawns the watcher; the failure backoff
+        # (recorded by run_session_improve_detailed) spaces the retry.
+        assert exit_reason() == "bridge_failed"
+        assert any(ev == "bridge_failed" for ev, _ in events)
+        assert not any(ev == "bridge_disabled_after_failure" for ev, _ in events)
+    else:
+        assert any(ev == "bridge_disabled_after_failure" for ev, _ in events)
+        assert exit_reason() == "signal", "kept polling with the bridge disabled"
 
 
-def test_shutdown_bridge_only_when_activity_is_newer_than_last_improve(harness, monkeypatch):
+def test_shutdown_bridge_only_when_activity_is_newer_than_last_improve(harness, suite, monkeypatch):
     watcher, pc, events, improves, run, exit_reason = harness
+    if suite.has_single_submit_improve:
+        pytest.skip("single-submit suites run no shutdown improve at all")
     monkeypatch.setattr(pc, "improve_throttle_reason", lambda sid: "cooldown")
 
     # Last improve older than the activity -> the shutdown bridge fires once.
@@ -153,6 +170,27 @@ def test_shutdown_bridge_only_when_activity_is_newer_than_last_improve(harness, 
     asyncio.run(run(stop_after=0.05))
     assert improves == []
     assert not any(ev == "shutdown_trigger" for ev, _ in events)
+
+
+def test_stopping_never_improves_on_single_submit_suites(harness, suite, monkeypatch):
+    """The SessionEnd sync that sends the SIGTERM spawns the final improve itself
+    (and the exit watcher does when the host dies without a SessionEnd), so a
+    watcher flush on stop only ever collided with it."""
+    watcher, pc, events, improves, run, exit_reason = harness
+    if not suite.has_single_submit_improve:
+        pytest.skip("suite still runs the shutdown improve")
+    monkeypatch.setattr(pc, "improve_throttle_reason", lambda sid: "cooldown")
+    # Activity newer than the last improve — the one case the old flush fired on.
+    monkeypatch.setattr(
+        pc, "read_improve_state", lambda sid: {"last_improved_at": time.time() - 500}
+    )
+
+    asyncio.run(run(stop_after=0.05))
+
+    assert improves == []
+    assert exit_reason() == "signal"
+    assert not any(ev.startswith("shutdown_") for ev, _ in events)
+    assert not hasattr(watcher, "_last_improved_at")
 
 
 def test_cooldown_check_failure_fails_open(harness, monkeypatch):

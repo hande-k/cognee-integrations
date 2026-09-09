@@ -12,6 +12,12 @@ and left pipeline runs stuck with the graph unwritten.
 Pure filesystem/pid logic, so it stays a unit test. The recall-payload half of
 the original file is now covered on the wire in integration/test_recall_via_http.py.
 
+Suites with ``has_single_submit_improve`` (claude-code 1.5.3, codex 1.6.3, SDK-594) have
+no such lock any more: repeated and parallel improves are safe server-side
+(watermarks + content-hash dedup), the busy loop this lock pre-empted is gone,
+and a busy answer is simply reported. Their contract lives in
+unit/test_improve_single_submit.py; this module is skipped for them.
+
 Migrated from {claude-code,codex}/tests/test_improve_session_lock.py.
 """
 
@@ -27,6 +33,8 @@ import pytest
 @pytest.fixture
 def pc(suite, isolated_modules, tmp_path, monkeypatch):
     """_plugin_common with its improve-lock dir pointed at a temp path."""
+    if suite.has_single_submit_improve:
+        pytest.skip("suite has no plugin-side improve lock (single-submit improve)")
     common = isolated_modules(suite, "_plugin_common")
     monkeypatch.setattr(common, "_IMPROVE_LOCK_DIR", tmp_path / "improve-locks")
     monkeypatch.setattr(common, "hook_log", lambda *a, **kw: None)

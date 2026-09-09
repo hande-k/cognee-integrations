@@ -116,9 +116,9 @@ def _poll_status(
 ):
     """Poll /api/v1/datasets/status (cognify_pipeline) until terminal or the deadline.
 
-    Returns "completed" | "errored" | "timeout" | "unknown". Deliberately mirrors
-    _plugin_common.wait_for_cognify but stays stdlib-only and opener-injectable so this
-    module keeps running under bare python3 (no plugin venv) and remains test-mockable.
+    Returns "completed" | "errored" | "timeout" | "unknown". The only cognify
+    poller in the plugin: stdlib-only and opener-injectable so this module keeps
+    running under bare python3 (no plugin venv) and remains test-mockable.
     """
     if not dataset_id:
         return "unknown"

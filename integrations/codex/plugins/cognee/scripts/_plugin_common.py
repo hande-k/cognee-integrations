@@ -46,14 +46,11 @@ _ACTIVITY_LOG = _PLUGIN_DIR / "activity.log"
 _SAVE_COUNTER = _PLUGIN_DIR / "save_counter.json"
 _SERVER_READY_MARKER = _SHARED_PLUGIN_ROOT / "server-ready.json"
 _SERVER_READY_TTL_SECONDS = 30
-# One lock file per session (see improve_session_lock): the idle watcher, the
-# store hook and the SessionEnd sync all bridge sessions, and only one of them
-# may have an improve in flight for a given session at a time.
-_IMPROVE_LOCK_DIR = _PLUGIN_DIR / "improve-locks"
-# One state file per session (see record_improve_success): when the last
-# successful improve ran and how many turns the session had at that point.
-# Every improve trigger records it; the idle and auto triggers consult it so
-# the cooldown survives the watcher's exit-after-bridge respawn cycle.
+# One state file per session (see record_improve_success / record_improve_failure):
+# when the last improve attempt ran, whether it landed, and how many turns the
+# session had at the last success. Every improve trigger records it; the idle
+# and auto triggers consult it so the cooldown (and the failure backoff) survive
+# the watcher's exit-after-bridge respawn cycle.
 _IMPROVE_STATE_DIR = _PLUGIN_DIR / "improve-state"
 # Per-agent-session buffer dirs. Each agent session (one Claude/Codex terminal)
 # owns its own file under these dirs, so two concurrent agents never
@@ -95,7 +92,11 @@ _LOG_LINE_CAP = 600
 
 # Default auto-improve threshold (tool calls + stops). Env override.
 AUTO_IMPROVE_EVERY_DEFAULT = 150
-SYNC_LOCK_STALE_SECONDS = 15 * 60
+# Read timeout for POST /api/v1/improve (COGNEE_IMPROVE_SUBMIT_TIMEOUT). Agent-context
+# extraction and distillation still run inside the request even with
+# run_in_background, and cognee's own LLM-retry floor is >=240s, so a tight
+# timeout guaranteed a client-side "timed out" on every slow moment.
+IMPROVE_SUBMIT_TIMEOUT_DEFAULT_SECONDS = 420.0
 _DEFAULT_LOCAL_SERVICE_URL = "http://localhost:8011"
 
 # --- Self-managed cognee runtime (SHARED with the Claude Code plugin) --------
@@ -1514,7 +1515,7 @@ def _improve_state_path(session_id: str) -> Path:
 
 
 def read_improve_state(session_id: str) -> dict:
-    """Last successful improve of ``session_id``; ``{}`` when it never improved."""
+    """Last improve attempt of ``session_id`` (success and failure fields); ``{}`` when none ran."""
     if not session_id:
         return {}
     data = _load_json_file(_improve_state_path(session_id))
@@ -1522,12 +1523,11 @@ def read_improve_state(session_id: str) -> dict:
 
 
 def record_improve_success(session_id: str, dataset: str, trigger: str) -> None:
-    """Persist that an improve of ``session_id`` just succeeded.
+    """Persist that an improve of ``session_id`` just landed.
 
-    Called by the improve function itself (``_run_session_improve_locked``) on a
-    confirmed submit, never by its callers: the idle watcher reports success even
-    when the per-session lock
-    refused it, so recording there would stamp an improve that never landed.
+    Called by ``run_session_improve_detailed`` itself on a confirmed 2xx submit,
+    never by its callers, so a skipped or failed attempt can never be stamped as
+    a success. Replaces the whole state, which also clears any failure backoff.
     The idle/auto triggers read this back through ``improve_throttle_reason``.
     Best-effort: a write failure is logged and never fails the improve.
     """
@@ -1548,14 +1548,44 @@ def record_improve_success(session_id: str, dataset: str, trigger: str) -> None:
         hook_log("improve_state_write_failed", {"session": session_id, "error": str(exc)[:200]})
 
 
+def record_improve_failure(session_id: str, dataset: str, trigger: str, reason: str) -> None:
+    """Persist that an improve attempt of ``session_id`` did not land.
+
+    ``reason`` is a short token (``busy``, ``timed out``, ``unreachable``, an
+    HTTP status...). Keeps the last success intact and stamps ``last_failed_at``,
+    which arms the same cooldown a success does (see ``improve_throttle_reason``),
+    so a busy, slow or unreachable server gets one automatic attempt per window.
+    Best-effort like its sibling.
+    """
+    if not session_id:
+        return
+    try:
+        state = read_improve_state(session_id)
+        state.update(
+            {
+                "session_id": session_id,
+                "dataset": dataset,
+                "last_failed_at": time.time(),
+                "last_failure_reason": str(reason or "")[:120],
+                "last_failure_trigger": trigger,
+                "failure_count": int(state.get("failure_count", 0) or 0) + 1,
+            }
+        )
+        _write_json_file(_improve_state_path(session_id), state)
+    except Exception as exc:
+        hook_log("improve_state_write_failed", {"session": session_id, "error": str(exc)[:200]})
+
+
 def improve_throttle_reason(session_id: str) -> str:
     """Why an idle/auto improve of ``session_id`` should be skipped right now.
 
     ``"cooldown"`` while the last successful improve is younger than
-    ``improve_cooldown_seconds()``; ``"no_new_entries"`` when nothing was stored
-    since it; ``""`` when an improve may run. A session that never improved is
-    never throttled. Only the automatic triggers (idle watcher, every-N entries)
-    honour this — the session-end, manual and dataset-switch syncs always run.
+    ``improve_cooldown_seconds()``; ``"backoff"`` while the last FAILED attempt
+    (busy, timeout, unreachable...) is; ``"no_new_entries"`` when nothing was
+    stored since the last success; ``""`` when an improve may run. A session that
+    never attempted an improve is never throttled. Only the automatic triggers
+    (idle watcher, every-N entries) honour this — the session-end, manual and
+    dataset-switch syncs always run.
     """
     state = read_improve_state(session_id)
     if not state:
@@ -1566,6 +1596,12 @@ def improve_throttle_reason(session_id: str) -> str:
         last = 0.0
     if last and time.time() - last < improve_cooldown_seconds():
         return "cooldown"
+    try:
+        failed = float(state.get("last_failed_at", 0) or 0)
+    except (TypeError, ValueError):
+        failed = 0.0
+    if failed and time.time() - failed < improve_cooldown_seconds():
+        return "backoff"
     try:
         count_then = int(state.get("turn_count_at_improve", -1))
     except (TypeError, ValueError):
@@ -1582,77 +1618,6 @@ def touch_activity() -> None:
         _ACTIVITY_FILE.write_text(str(datetime.now(timezone.utc).timestamp()), encoding="utf-8")
     except Exception as exc:
         hook_log("activity_touch_failed", {"path": str(_ACTIVITY_FILE), "error": str(exc)[:200]})
-
-
-@contextmanager
-def improve_session_lock(session_id: str, owner: str):
-    """Admit exactly one in-flight improve per session, machine-wide.
-
-    Three paths bridge the same session — the idle watcher, ``store-to-session``,
-    and the SessionEnd sync — and nothing else stops two of them submitting the
-    same session concurrently. The server's own per-session lock then answered
-    the loser with ``{}`` (busy), which drove a 15s retry loop for up to ten
-    minutes; concurrent writers also collide on the single-writer graph/vector
-    store ("Could not set lock on file"), leaving pipeline runs stuck and the
-    graph unwritten.
-
-    So claim locally BEFORE submitting: the loser skips entirely rather than
-    waiting, because the winner is already bridging the very same session — the
-    work is not lost, it is in flight. Yields True when claimed, False when
-    another process owns it.
-
-    Stale handling (dead pid or older than ``SYNC_LOCK_STALE_SECONDS``) means a
-    crashed worker cannot wedge a session, and the lock fails OPEN on unexpected
-    errors — a lock we cannot manage must never be the reason a session goes
-    unsynced.
-    """
-    if not session_id:
-        yield True
-        return
-
-    digest = hashlib.sha1(str(session_id).encode("utf-8")).hexdigest()
-    lock_path = _IMPROVE_LOCK_DIR / f"{digest}.lock"
-    acquired = False
-    try:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        now = datetime.now(timezone.utc).timestamp()
-        if lock_path.exists():
-            try:
-                current = json.loads(lock_path.read_text(encoding="utf-8"))
-                created_at = float(current.get("created_at", 0))
-                pid = int(current.get("pid", 0))
-            except Exception:
-                created_at, pid = 0.0, 0
-            if not (pid > 0 and _proc.pid_alive(pid)) or now - created_at > SYNC_LOCK_STALE_SECONDS:
-                try:
-                    lock_path.unlink()
-                    hook_log(
-                        "improve_lock_stale_cleared",
-                        {"session": session_id, "owner": owner, "stale_pid": pid},
-                    )
-                except FileNotFoundError:
-                    pass  # another process cleared the same stale lock
-                except Exception as exc:
-                    hook_log("improve_lock_unlink_failed", {"error": str(exc)[:200]})
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump({"owner": owner, "pid": os.getpid(), "created_at": now}, fh)
-            acquired = True
-            yield True
-        except FileExistsError:
-            hook_log("improve_skipped_concurrent", {"session": session_id, "owner": owner})
-            yield False
-    except Exception as exc:
-        # Fail open: never let lock bookkeeping cost a session its sync.
-        hook_log("improve_lock_failed_open", {"session": session_id, "error": str(exc)[:200]})
-        yield True
-    finally:
-        if acquired:
-            try:
-                lock_path.unlink()
-            except Exception as exc:
-                hook_log("improve_lock_release_failed", {"error": str(exc)[:200]})
 
 
 def _local_api_url_with_source() -> tuple[str, str]:
@@ -3586,9 +3551,7 @@ def maybe_check_for_update() -> None:
         if not _update_check_enabled():
             return
         marker = _load_json_file(_UPDATE_CHECK_FILE)
-        interval = _improve_float_env(
-            "COGNEE_UPDATE_CHECK_INTERVAL", _UPDATE_CHECK_INTERVAL_DEFAULT
-        )
+        interval = _float_env("COGNEE_UPDATE_CHECK_INTERVAL", _UPDATE_CHECK_INTERVAL_DEFAULT)
         now = datetime.now(timezone.utc).timestamp()
         if now - float(marker.get("last_checked_at", 0) or 0) < interval:
             return  # checked recently
@@ -3744,69 +3707,6 @@ def elapsed_ms(start: float) -> int:
     an int so the ``elapsed_ms`` fields in hook.log stay compact and easy to query.
     """
     return round((time.monotonic() - start) * 1000)
-
-
-def wait_for_cognify(
-    dataset_id: str,
-    *,
-    deadline_seconds: float,
-    interval_seconds: float = 3.0,
-    pipeline: str = "cognify_pipeline",
-    request_timeout: float = 10.0,
-) -> str:
-    """Poll GET /api/v1/datasets/status until the cognify pipeline is terminal or the deadline.
-
-    Returns one of:
-      "completed" — DATASET_PROCESSING_COMPLETED (graph queryable; safe to mark written)
-      "errored"   — DATASET_PROCESSING_ERRORED (do NOT mark; a later attempt should retry)
-      "timeout"   — deadline elapsed while still processing (do NOT mark; retry)
-      "unknown"   — cannot poll: no dataset_id, or the status route is absent (older server)
-
-    A background remember returns immediately with a dataset_id; this confirms the
-    server-side cognify actually finished instead of fire-and-forgetting, so the bridge
-    never holds one synchronous request open past the cloud's request ceiling.
-    """
-    if not dataset_id:
-        return "unknown"
-    path = (
-        f"/api/v1/datasets/status?dataset={urllib.parse.quote(str(dataset_id))}"
-        f"&pipeline={urllib.parse.quote(pipeline)}"
-    )
-    deadline = time.monotonic() + max(0.0, deadline_seconds)
-    while True:
-        try:
-            result = _json_http_request(path, None, method="GET", timeout=request_timeout)
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                # Older server without the status route — can't confirm, don't loop.
-                return "unknown"
-            hook_log(
-                "cognify_poll_transient",
-                {"dataset_id": dataset_id, "error": f"HTTP {exc.code}"},
-            )
-            result = None
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            hook_log("cognify_poll_transient", {"dataset_id": dataset_id, "error": str(exc)[:120]})
-            result = None
-
-        status = ""
-        if isinstance(result, dict) and result:
-            raw = result.get(str(dataset_id))
-            if raw is None and len(result) == 1:
-                raw = next(iter(result.values()))
-            # A multi-pipeline response nests {pipeline: status}; unwrap if needed.
-            if isinstance(raw, dict):
-                raw = raw.get(pipeline)
-            status = str(raw or "").upper()
-
-        if status.endswith("COMPLETED"):
-            return "completed"
-        if status.endswith("ERRORED"):
-            return "errored"
-
-        if time.monotonic() >= deadline:
-            return "timeout"
-        time.sleep(max(0.1, interval_seconds))  # floor avoids a tight spin if misconfigured to 0
 
 
 _TYPED_DATASET_CAPABILITIES = {}
@@ -4209,18 +4109,6 @@ def _backend_reachable(base_url: str, timeout: float = 1.5) -> bool:
 # improve now simply reports the session as not synced.
 
 
-def _improve_float_env(name: str, default: float) -> float:
-    try:
-        raw = os.environ.get(name, "").strip()
-        return float(raw) if raw else default
-    except (TypeError, ValueError):
-        return default
-
-
-def _improve_submit_timeout() -> float:
-    return _improve_float_env("COGNEE_IMPROVE_SUBMIT_TIMEOUT", 180.0)
-
-
 _AMBIGUOUS_KEY = "_replay_ambiguous"
 
 
@@ -4304,7 +4192,7 @@ def _server_session_fingerprints(detail: dict) -> set:
 
 _DRAIN_LOCK = _PLUGIN_DIR / "drain.lock"
 _DRAIN_LOCK_STALE_SECONDS = 60.0
-# Pause before the one in-place drain retry in run_session_improve: long enough
+# Pause before the one in-place drain retry in run_session_improve_detailed: long enough
 # for a momentary server blip to pass, short enough not to hold up a sync.
 _DRAIN_RETRY_PAUSE_SECONDS = 2.0
 
@@ -4562,16 +4450,22 @@ def improve_session_via_http(dataset: str, session_id: str, *, timeout: float = 
     so the submit timeout must stay generous — this must only ever be called
     from detached workers/async hooks, never a synchronous hook window.
 
-    A 2xx submit counts as success: improve is idempotent (unchanged session
-    content dedups server-side by content hash, and a per-session improve lock
-    makes a concurrent run a no-op).
+    A 2xx submit counts as success: improve is idempotent (every stage is
+    guarded by a per-session watermark or dedups by content hash). An empty
+    ``{}`` body means the server's per-session improve lock is held by another
+    run; that is reported as ``busy`` and never retried here (see
+    ``run_session_improve_detailed``). Nothing is polled after the submit.
     """
     if not dataset or not session_id:
         return {"ok": False, "error": "missing dataset/session"}
     from _project_memory import route
 
     dataset = route(dataset, session_id)["write"]
-    submit_timeout = timeout if timeout is not None else _improve_submit_timeout()
+    submit_timeout = (
+        timeout
+        if timeout is not None
+        else _float_env("COGNEE_IMPROVE_SUBMIT_TIMEOUT", IMPROVE_SUBMIT_TIMEOUT_DEFAULT_SECONDS)
+    )
     improve_payload = {
         **write_fields(dataset),
         "session_ids": [session_id],
@@ -4600,33 +4494,13 @@ def improve_session_via_http(dataset: str, session_id: str, *, timeout: float = 
 
     if isinstance(result, dict) and not result:
         # The server's per-session improve lock skipped this run ({} response):
-        # another improve is in flight. That run may have extracted the session
-        # cache BEFORE the latest turns landed, so a skip is NOT success — the
-        # caller must retry once the lock frees.
+        # another improve of this session is in flight. Reported as busy, not
+        # success — but never retried: the in-flight run persists everything
+        # above the session watermark, and whatever landed after its snapshot
+        # is picked up by the next trigger.
         return {"ok": False, "busy": True}
 
-    outcome = {"ok": True, "result": result if isinstance(result, dict) else {}}
-    # Best-effort observability: the submit already succeeded, so a poll that
-    # times out or errors must never turn that into a failure. Reporting the
-    # pipeline states is what lets a caller (and the tests) distinguish "the
-    # bridge was accepted" from "the graph actually finished building" — without
-    # it, improve returns ok while the graph is still empty, which reads as a
-    # silent data-loss bug from the outside.
-    #
-    # Parity with claude-code, which gained this in the background-remember
-    # refactor; the rest of that work was ported here but the improve path was
-    # missed, so codex reported no cognify_status at all.
-    poll_deadline = _float_env("COGNEE_IMPROVE_POLL_DEADLINE", 600.0)
-    dataset_id = ""
-    if isinstance(result, dict):
-        dataset_id = str(result.get("dataset_id") or "")
-    if dataset_id and poll_deadline > 0:
-        half = poll_deadline / 2
-        outcome["cognify_status"] = wait_for_cognify(dataset_id, deadline_seconds=half)
-        outcome["memify_status"] = wait_for_cognify(
-            dataset_id, deadline_seconds=half, pipeline="memify_pipeline"
-        )
-    return outcome
+    return {"ok": True, "result": result if isinstance(result, dict) else {}}
 
 
 def ensure_dataset_via_http(dataset: str) -> None:
@@ -4690,79 +4564,78 @@ def ensure_dataset_via_http(dataset: str) -> None:
         hook_log("dataset_ensure_failed", {"dataset": dataset, "error": str(exc)[:200]})
 
 
-def run_session_improve(dataset: str, session_id: str, *, trigger: str = "final") -> bool:
-    """API-mode session->graph sync: drain warmup entries, then improve.
+def run_session_improve_detailed(dataset: str, session_id: str, *, trigger: str = "final") -> dict:
+    """API-mode session->graph sync: drain warmup entries, then ONE improve submit.
 
     ``trigger`` names the caller (``idle``, ``auto``, ``final``, ``manual``,
-    ``switch``) and is recorded with the session's improve state on success.
-    A server without session-aware improve is reported as not synced — there
-    is no fallback. Returns True when a sync ran successfully.
+    ``switch``) and is recorded with the session's improve state. Returns
+    ``{"ok": bool, "reason": str, "error": str}``: ``ok`` when the improve landed
+    and the drain was complete; otherwise ``reason`` is ``busy`` (another improve
+    of this session is in flight server-side), ``unreachable`` (backend down,
+    nothing submitted), ``incomplete_drain`` (the submit landed but buffered
+    entries never reached the server cache) or ``failed`` (see ``error``).
 
-    Serialized per session by ``improve_session_lock``. The guard lives here
-    rather than at the three call sites (idle watcher, store hook, SessionEnd
-    sync) so every path is covered by construction and a future fourth caller
-    cannot reintroduce the double-submit.
+    No local lock, no busy-wait, no status polling: repeated and parallel
+    improves are safe server-side (per-QA applied markers, per-session
+    watermarks, content-hash dedup at ingest), so a second submit can only cost
+    money, and the cooldown/backoff in ``improve_throttle_reason`` is what
+    bounds that. A busy answer is reported and left to the next trigger, which
+    covers whatever the in-flight run's snapshot missed. Every attempt that does
+    not land arms the failure backoff.
     """
-    with improve_session_lock(session_id, "run_session_improve") as claimed:
-        if not claimed:
-            # Another process is already bridging this exact session. Report
-            # not-synced so the caller's own retry/reporting path is unchanged;
-            # the work itself is in flight, not dropped.
-            return False
-        return _run_session_improve_locked(dataset, session_id, trigger=trigger)
-
-
-def _run_session_improve_locked(dataset: str, session_id: str, *, trigger: str = "final") -> bool:
-    """Body of run_session_improve; assumes the per-session claim is held."""
-    base_url = _local_api_url()
-    if not _backend_reachable(base_url):
-        return False
-    # Detached/idle context: nothing user-visible waits on this, so the drain
-    # gets a far larger budget than the per-prompt hook's default.
-    final_budget = _improve_float_env("COGNEE_DRAIN_BUDGET_FINAL", 120.0)
-    _, remaining = drain_warmup_entries(dataset, session_id, budget_seconds=final_budget)
-    if remaining:
-        # One bounded retry after a short pause: the tail usually failed on a
-        # momentary blip, and improve reads only what reached the server cache.
-        time.sleep(_DRAIN_RETRY_PAUSE_SECONDS)
+    remaining = 0
+    if not _backend_reachable(_local_api_url()):
+        result: dict = {"ok": False, "error": "backend unreachable"}
+        reason = "unreachable"
+    else:
+        # Detached/idle context: nothing user-visible waits on this, so the drain
+        # gets a far larger budget than the per-prompt hook's default.
+        final_budget = _float_env("COGNEE_DRAIN_BUDGET_FINAL", 120.0)
         _, remaining = drain_warmup_entries(dataset, session_id, budget_seconds=final_budget)
-    ensure_dataset_via_http(dataset)
-    outcome = improve_session_via_http(dataset, session_id)
-    if outcome.get("unsupported"):
-        # No session-aware improve on this server. Nothing else is tried: the
-        # old document bridge re-cognified the whole transcript on every sync.
-        hook_log(
-            "improve_unsupported",
-            {"dataset": dataset, "session": session_id, "status": outcome.get("status")},
-        )
-    # Busy = another improve holds the session lock (e.g. an idle-watcher run
-    # racing the SessionEnd sync). That run's snapshot may predate the latest
-    # turns, so wait for the lock to free and re-submit; the retried improve
-    # dedups unchanged content server-side, so this never double-processes.
-    busy_deadline = time.monotonic() + _improve_float_env("COGNEE_IMPROVE_BUSY_DEADLINE", 600.0)
-    busy_interval = max(0.1, _improve_float_env("COGNEE_IMPROVE_BUSY_RETRY_INTERVAL", 15.0))
-    while outcome.get("busy") and time.monotonic() < busy_deadline:
-        hook_log("improve_busy_retry", {"dataset": dataset, "session": session_id})
-        time.sleep(busy_interval)
-        outcome = improve_session_via_http(dataset, session_id)
+        if remaining:
+            # One bounded retry after a short pause: the tail usually failed on a
+            # momentary blip, and improve reads only what reached the server cache.
+            time.sleep(_DRAIN_RETRY_PAUSE_SECONDS)
+            _, remaining = drain_warmup_entries(dataset, session_id, budget_seconds=final_budget)
+        ensure_dataset_via_http(dataset)
+        result = improve_session_via_http(dataset, session_id)
+        if result.get("unsupported"):
+            # No session-aware improve on this server. Nothing else is tried: the
+            # old document bridge re-cognified the whole transcript on every sync.
+            hook_log(
+                "improve_unsupported",
+                {"dataset": dataset, "session": session_id, "status": result.get("status")},
+            )
+        if result.get("ok"):
+            reason = "incomplete_drain" if remaining else ""
+        elif result.get("busy"):
+            reason = "busy"
+        else:
+            reason = "failed"
+    ok = bool(result.get("ok"))
+    error = str(result.get("error") or "")
     hook_log(
         "improve_fired",
         {
             "dataset": dataset,
             "session": session_id,
             "trigger": trigger,
-            "ok": bool(outcome.get("ok")),
-            "busy": bool(outcome.get("busy")),
-            "error": str(outcome.get("error") or "")[:120],
+            "ok": ok,
+            "reason": reason,
+            "error": error[:120],
         },
     )
-    if outcome.get("ok"):
+    if ok:
         record_improve_success(session_id, dataset, trigger)
         # Status-line credits: attribute the spend recorded since the previous
         # reading to this improve. Approximate on purpose — the submit is
         # run_in_background, so part of this run's cognify cost lands in later
         # unlabeled refreshes. refresh_credits never raises and no-ops locally.
         refresh_credits("improve")
+    else:
+        record_improve_failure(
+            session_id, dataset, trigger, (error or "failed") if reason == "failed" else reason
+        )
     if remaining:
         # Buffered entries never reached the server cache, so the improve above
         # persisted an incomplete session. Partial persist beats none (hence the
@@ -4771,15 +4644,9 @@ def _run_session_improve_locked(dataset: str, session_id: str, *, trigger: str =
         # trimmed from the buffer, so the re-run replays only the tail.
         hook_log(
             "improve_incomplete_drain",
-            {
-                "dataset": dataset,
-                "session": session_id,
-                "remaining": remaining,
-                "improve_ok": bool(outcome.get("ok")),
-            },
+            {"dataset": dataset, "session": session_id, "remaining": remaining, "improve_ok": ok},
         )
-        return False
-    return bool(outcome.get("ok"))
+    return {"ok": ok and not remaining, "reason": reason, "error": error}
 
 
 # ---------------------------------------------------------------------------
@@ -4823,7 +4690,8 @@ _SWEEP_LOG_FILES = (
     "activity.log",
 )
 #: Directories older plugin versions created here and nothing reads any more.
-_SWEEP_LEGACY_DIRS = ("statusline",)
+#: improve-locks: the machine-wide per-session improve lock removed in 1.6.3.
+_SWEEP_LEGACY_DIRS = ("statusline", "improve-locks")
 #: Files likewise. recall-breaker.json: cognee-search.sh used to redirect the
 #: circuit breaker into this dir, splitting it from the one the hooks use.
 _SWEEP_LEGACY_FILES = ("recall-breaker.json",)
@@ -4893,29 +4761,6 @@ def _sweep_launch_records(now: float, counts: dict) -> None:
             _sweep_remove(path, counts, "launch_records")
 
 
-def _sweep_improve_locks(now: float, counts: dict) -> None:
-    """Dead-pid or over-age locks. ``improve_session_lock`` clears such a lock
-    only when the *same* session locks again, which for an ended session is
-    never — so a crash left a lock file behind for good."""
-    try:
-        entries = list(_IMPROVE_LOCK_DIR.glob("*.lock"))
-    except OSError:
-        return
-    for path in entries:
-        stale = False
-        try:
-            current = json.loads(path.read_text(encoding="utf-8"))
-            pid = int(current.get("pid", 0) or 0)
-            created_at = float(current.get("created_at", 0) or 0)
-            stale = (
-                not (pid > 0 and _proc.pid_alive(pid)) or now - created_at > SYNC_LOCK_STALE_SECONDS
-            )
-        except Exception:
-            stale = True  # unreadable lock: nothing can release it either
-        if stale:
-            _sweep_remove(path, counts, "improve_locks")
-
-
 def sweep_stale_state(now: Optional[float] = None) -> dict:
     """Remove this plugin's dead per-session files and legacy leftovers.
 
@@ -4938,7 +4783,6 @@ def sweep_stale_state(now: Optional[float] = None) -> dict:
             _sweep_dir_by_age(directory, _SWEEP_SESSION_FILE_MAX_AGE_SECONDS, now, counts, key)
         _sweep_pending_husks(counts)
         _sweep_launch_records(now, counts)
-        _sweep_improve_locks(now, counts)
         for name in _SWEEP_LEGACY_FILES:
             legacy_file = _PLUGIN_DIR / name
             if legacy_file.is_file():
