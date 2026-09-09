@@ -14,6 +14,8 @@ Stops cleanly on:
 Survives Antigravity crashes better than foreground hooks.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import os

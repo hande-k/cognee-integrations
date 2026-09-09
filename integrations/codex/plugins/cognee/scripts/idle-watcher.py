@@ -17,6 +17,8 @@ watcher runs the session's final improve itself (and the exit watcher does
 the same when the host dies without a SessionEnd).
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import os

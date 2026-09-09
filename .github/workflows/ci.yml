@@ -114,6 +114,39 @@ jobs:
         working-directory: integrations/${{ matrix.integration }}
         run: uv run pytest tests/ -v
 
+  # The hook-based plugins (claude-code, codex, antigravity) must run under the
+  # oldest python3 users commonly have on PATH — macOS's Xcode Command Line Tools
+  # ship 3.9.6 — because the hooks run under it before (and, in cloud mode,
+  # instead of) the plugin's own uv-managed 3.12 venv. A `X | None` annotation
+  # without `from __future__ import annotations` breaks every hook at import time
+  # on 3.9 and nothing else catches it (SDK-617). The shared suite's pyproject
+  # pins 3.10+ for its own tooling, so this cell builds an ad-hoc 3.9 environment.
+  test-hooks-python39:
+    needs: detect-changes
+    if: ${{ contains(needs.detect-changes.outputs.python, '"tests"') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Run the shared hook suite on Python 3.9
+        working-directory: integrations/tests
+        run: >-
+          uv run --no-project --python 3.9
+          --with "pytest>=8" --with "pytest-httpserver>=1.0"
+          pytest tests/unit tests/integration tests/e2e -q
+
   test-typescript:
     needs: detect-changes
     if: ${{ needs.detect-changes.outputs.typescript != '[]' }}
@@ -173,13 +206,14 @@ jobs:
   claude-review:
     name: Claude Code Review
     timeout-minutes: 15
-    needs: [ detect-changes, test-python, test-typescript ]
+    needs: [ detect-changes, test-python, test-hooks-python39, test-typescript ]
     if: >-
       ${{ !cancelled()
           && github.event_name == 'pull_request'
           && github.event.pull_request.head.repo.full_name == github.repository
           && needs.detect-changes.result == 'success'
           && needs.test-python.result != 'failure'
+          && needs.test-hooks-python39.result != 'failure'
           && needs.test-typescript.result != 'failure' }}
     runs-on: ubuntu-latest
     continue-on-error: true

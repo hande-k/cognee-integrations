@@ -1,5 +1,7 @@
 """Small cross-process lock with bounded acquisition on POSIX and Windows."""
 
+from __future__ import annotations
+
 import os
 import time
 from contextlib import contextmanager

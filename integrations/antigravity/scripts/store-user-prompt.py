@@ -9,6 +9,8 @@ Configuration:
     Resolves session state via Cognee HTTP endpoints.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import os

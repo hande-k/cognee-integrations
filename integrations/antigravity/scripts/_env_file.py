@@ -29,6 +29,8 @@ Loading must never break a hook: any parse or IO problem results in the file
 being (partially) ignored, never an exception.
 """
 
+from __future__ import annotations
+
 import os
 import stat
 import sys

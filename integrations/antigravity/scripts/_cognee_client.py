@@ -15,6 +15,8 @@ short-lived process, so in-memory state (as a long-lived provider like Hermes
 uses) would not survive between calls. State lives in the plugin state dir.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import pathlib

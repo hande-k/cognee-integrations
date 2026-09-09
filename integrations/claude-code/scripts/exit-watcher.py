@@ -7,6 +7,8 @@ does nothing while Codex is alive; once that PID disappears, it starts the
 normal detached graph sync worker and exits.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import subprocess

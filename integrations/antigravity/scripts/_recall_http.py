@@ -25,6 +25,8 @@ Contract — what gets printed to stdout:
 Diagnostics also go to stderr so the caller can surface them.
 """
 
+from __future__ import annotations
+
 import errno
 import json
 import os

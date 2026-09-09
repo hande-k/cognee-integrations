@@ -53,6 +53,11 @@ Python package with the `hermes_agent.plugins` entry point.
 
 ### Prerequisites
 
+- **Python 3.10 or newer.** This integration imports cognee in-process
+  (`requires-python = ">=3.10"` in `pyproject.toml`), so it inherits cognee's
+  own floor; `pip` refuses to install it on 3.9. Note that macOS's Xcode
+  Command Line Tools ship Python 3.9.6 — use a Homebrew, python.org or
+  [uv](https://docs.astral.sh/uv/)-managed 3.10+ interpreter instead.
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent) installed
   (`curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`).
 - **Local mode:** an LLM API key (e.g. OpenAI) — cognee uses it to build the

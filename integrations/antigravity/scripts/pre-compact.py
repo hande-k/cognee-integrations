@@ -10,6 +10,8 @@ query at compact time, and deriving one from recalled/compacted context can feed
 synthetic text back into Cognee as if it were a user question.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import os

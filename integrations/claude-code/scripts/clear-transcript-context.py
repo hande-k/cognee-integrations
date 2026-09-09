@@ -6,6 +6,8 @@ Stop hook is the integration-level demo workaround: when enabled, it empties
 the transcript file Claude passes in the hook payload.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import sys

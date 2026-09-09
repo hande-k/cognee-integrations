@@ -63,6 +63,8 @@ identical-looking results, which is why the skills tell the agent to say which
 one it is answering from when the work is in progress.
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os

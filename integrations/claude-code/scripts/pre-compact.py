@@ -11,6 +11,8 @@ Everything goes through the Cognee server over HTTP (``/api/v1/recall`` and
 plugin booted a local server or is connected to a remote one.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import os

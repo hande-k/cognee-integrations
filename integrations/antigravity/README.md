@@ -6,6 +6,8 @@ completed turns for later retrieval.
 
 ## Install
 
+**Requirements.** Any Python 3.9 or newer available as `python3` (or `python`) on PATH — the hooks are stdlib-only HTTP clients and never import cognee, so the Python 3.9.6 that ships with macOS's Xcode Command Line Tools is enough. In local mode the plugin brings its own runtime for the Cognee server: it fetches [uv](https://docs.astral.sh/uv/) into `~/.cognee-plugin/uv` and builds a Python 3.12 virtualenv with it (reusing a 3.12 already on the machine, otherwise downloading a ~66 MB standalone build). Only when uv is absent *and* cannot be downloaded does the plugin fall back to the host interpreter, and that fallback needs Python 3.10 or newer: on an older host it refuses, logs `host_python_too_old_for_venv` to `hook.log`, and every session start says so until uv or a newer python3 is installed. Cloud mode never builds a runtime. (SDK-based integrations such as LangGraph or CrewAI import cognee in-process and need Python 3.10+; see [`CONFIGURATION.md`](../CONFIGURATION.md#python-version-requirements).)
+
 From a checkout of this repository, validate the package before installing it:
 
 ```bash

@@ -27,6 +27,8 @@ Supports three modes:
   - Server: Legacy — direct base_url (kept for backward compat)
 """
 
+from __future__ import annotations
+
 import json
 import os
 import subprocess

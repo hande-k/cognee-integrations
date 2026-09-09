@@ -5,6 +5,8 @@ single log-to-disk helper. Hook scripts shouldn't grow heavy because
 they run on every user prompt / tool call.
 """
 
+from __future__ import annotations
+
 import asyncio
 import errno
 import hashlib

@@ -10,6 +10,30 @@ is the cache key and semver record, bumped on each release, not the update trigg
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.5]
+
+### Fixed
+- **The hooks run on Python 3.9 again (SDK-617).** Every hook script failed at
+  import time under a 3.9 `python3` — the one macOS ships with the Xcode Command
+  Line Tools — with `TypeError: unsupported operand type(s) for |`, because
+  `X | None` annotations are evaluated when a function is defined. Nothing in the
+  hooks needs 3.10 at runtime: they are stdlib HTTP clients, and cognee runs in
+  the uv-managed Python 3.12 venv the bootstrap builds. Every script now carries
+  `from __future__ import annotations`, so the plugin works on any Python
+  3.9+ host; the shared suite runs on 3.9 in CI to keep it that way.
+- **The uv-less install fallback refuses a host python older than 3.10.** When uv
+  is unavailable and cannot be downloaded, the bootstrap builds the runtime venv
+  from the host interpreter, which then inherits cognee's 3.10+ floor. Instead of
+  building a venv cognee cannot install into, it now logs
+  `host_python_too_old_for_venv` to `~/.cognee-plugin/codex/hook.log`, prints the interpreter path and
+  version to stderr, and leaves a marker that every following SessionStart turns
+  into a systemMessage naming the fix (install uv or a 3.10+ python3) until a venv
+  is built.
+
+### Changed
+- README states the Python requirement up front: 3.9+ for the hooks, 3.10+ only
+  for the uv-less fallback; SDK-based integrations keep their 3.10+ floor.
+
 ## [1.6.4]
 
 ### Changed
