@@ -20,6 +20,7 @@ from pathlib import Path
 # Add scripts dir to path for helper imports
 sys.path.insert(0, os.path.dirname(__file__))
 from _plugin_common import (
+    get_session_detail_via_http,
     get_session_key,
     hook_log,
     load_resolved,
@@ -144,6 +145,25 @@ async def _recall(
         return []
 
 
+def _recent_entries_via_http(session_id: str) -> tuple[list, list]:
+    """Return (recent QA entries, recent trace entries) straight from the server.
+
+    The seed recall passes an empty query (there is no user question at compact
+    time) and ``/recall`` matches nothing on an empty string, so the session
+    detail endpoint — which returns the last ~20 QA and trace rows without a
+    query — is what actually produces the anchor mid-session. Same fallback as
+    claude-code's and codex's pre-compact: in server mode the session cache
+    lives on the server, and the local session-manager read below has nothing
+    to read (and no ``cognee`` to import against a remote tenant).
+    """
+    detail = get_session_detail_via_http(session_id)
+    if not isinstance(detail, dict):
+        return [], []
+    qas = [r for r in (detail.get("qas") or []) if isinstance(r, dict)]
+    traces = [r for r in (detail.get("traces") or []) if isinstance(r, dict)]
+    return qas[-_SESSION_TOP_K:], traces[-_TRACE_TOP_K:]
+
+
 def _format_session_section(entries: list) -> str:
     lines = ["### Session Memory (recent turns)"]
     for entry in entries:
@@ -218,8 +238,12 @@ async def _run():
 
     # Fall back: if recall returned nothing (keyword-miss on empty query),
     # pull entries directly. This keeps the anchor useful mid-session
-    # before any user prompts have landed in the cache.
-    if not session_entries and not trace_entries:
+    # before any user prompts have landed in the cache. In server mode that
+    # is an HTTP read of the session detail; the local session-manager read
+    # only applies when the cache is on this machine.
+    if not session_entries and not trace_entries and is_cloud_mode(config):
+        session_entries, trace_entries = _recent_entries_via_http(session_id)
+    if not session_entries and not trace_entries and not is_cloud_mode(config):
         try:
             from cognee.infrastructure.session.get_session_manager import get_session_manager
 

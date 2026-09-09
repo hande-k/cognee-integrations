@@ -50,6 +50,46 @@ def _dump(label: str, body: str, limit: int = 1500) -> None:
         print(f"[live artifacts] {label}:\n{body[-limit:]}")
 
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Print a failure's traceback and captured output the moment it happens.
+
+    pytest holds every failure report until the session ends. In this tier a
+    single scenario can legitimately take ten-plus minutes, and the CI job has a
+    hard ``timeout-minutes`` — so a run that is cut short by the timeout leaves
+    behind a log with ``FAILED`` lines and nothing else. Nine consecutive
+    nightly cloud runs were cancelled that way without a single traceback
+    surviving. Emitting each failure immediately is what makes the next such
+    run diagnosable from its log alone.
+
+    The teardown report is included too: that is where ``live_artifacts``
+    prints hook.log and the recall audit, which is usually where the answer is.
+    """
+    outcome = yield
+    report = outcome.get_result()
+    failed_key = "live_failed_phase"
+    if report.failed and report.when in ("setup", "call"):
+        setattr(item, failed_key, True)
+    if not (report.failed or (report.when == "teardown" and getattr(item, failed_key, False))):
+        return
+    terminal = item.config.pluginmanager.get_plugin("terminalreporter")
+    if terminal is None:
+        return
+    terminal.ensure_newline()
+    terminal.section(f"live {report.when} {report.outcome}: {item.nodeid}", sep="-", red=True)
+    if report.failed and report.longrepr is not None:
+        terminal.line(str(report.longrepr))
+    for name, content in report.sections:
+        # The teardown report carries the earlier phases' output again; those
+        # were already printed above, so only the teardown's own is new.
+        if report.when == "teardown" and "teardown" not in name:
+            continue
+        if content.strip():
+            terminal.section(name, sep="~")
+            terminal.line(content.rstrip())
+    terminal.flush()
+
+
 def pytest_collection_modifyitems(config, items):
     """Drop ``local_only`` scenarios when the backend is a remote tenant.
 
@@ -339,6 +379,7 @@ def session_for(
     live_project: Path,
     live_base_url: str,
     live_dataset: str,
+    live_api_key: str,
     live_port: int,
 ):
     """Boot a session for an *explicitly named* suite, sharing one server.
@@ -350,6 +391,13 @@ def session_for(
     Every session shares the HOME, port, and dataset — so the graph is shared while
     each suite keeps its own state subdirectory, which is exactly the arrangement
     the shared-brain claim rests on.
+
+    Builds its own env rather than reusing ``live_env`` (which is bound to the
+    parametrised suite), so it must thread the same ``api_key``. Without it the
+    cross-suite sessions were the only ones running keyless on cloud: the plugin
+    cannot mint against a tenant, every store got 401, and the final sync gave up
+    with "no server credentials resolved" — a failure that looked like a
+    shared-memory bug and was really this fixture.
     """
 
     def _make(suite: Suite, name: str, *, start: bool = True) -> LiveSession:
@@ -364,6 +412,7 @@ def session_for(
                 dataset=live_dataset,
                 llm_api_key=live_prereqs,
                 suite=suite,
+                api_key=live_api_key,
             ),
             session_id=f"live-{name}-{uuid.uuid4().hex[:8]}",
         )

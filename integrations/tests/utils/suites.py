@@ -75,14 +75,14 @@ class Suite:
     has_rich_statusline: bool
     #: Capability: ``pre-compact.py`` produces an anchor against a server.
     #:
-    #: Still False for claude-code. It now HAS the ``recall_via_http`` branch, but
-    #: that alone is not enough: the seed recall passes an empty query (there is no
-    #: user question at compact time) and the server matches nothing on an empty
-    #: string — verified directly, query="" returns 0 while a real term returns 1.
-    #: codex reaches an anchor only via the local session-manager fallback, which
-    #: works because the plugin boots the server under the same HOME; claude-code
-    #: does not get there. Closing this needs a server-side way to read recent
-    #: session entries without a query, not more client-side branching.
+    #: True for every suite since the local-SDK path was removed (PR #405). The
+    #: seed recall still passes an empty query (there is no user question at
+    #: compact time) and the server matches nothing on it, but claude-code's hook
+    #: now falls back to the session *detail* endpoint, which returns the recent
+    #: QA and trace rows without a query — so the anchor is built over HTTP on
+    #: both backends. Kept as a flag rather than an assumption: a future
+    #: integration could arrive without that fallback, and the live test would
+    #: then say so instead of asserting an anchor it cannot produce.
     has_precompact_http: bool
     #: Capability (SDK-594): one improve submit per trigger. The improve path takes
     #: no machine-wide per-session lock, never re-submits a busy answer, has no
@@ -112,7 +112,7 @@ CLAUDE = Suite(
     has_async_hooks=True,
     has_recall_latency_metric=True,
     has_rich_statusline=True,
-    has_precompact_http=False,
+    has_precompact_http=True,
     has_single_submit_improve=True,
 )
 

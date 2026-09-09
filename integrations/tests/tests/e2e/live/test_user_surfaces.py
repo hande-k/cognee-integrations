@@ -116,20 +116,19 @@ def test_precompact_produces_an_anchor_carrying_the_session(
 ):
     """Compaction drops the transcript; the anchor is what carries memory across it.
 
-    Codex and Antigravity recall over HTTP and must produce an anchor against a real
-    server. Claude Code's pre-compact remains local-SDK only — ``cognee.recall``
-    plus a ``get_session_manager()`` fallback — while in server mode the session
-    cache lives on the server. Session and trace entries come back empty, the
-    derived query stays empty, the graph scopes are never queried, and the hook
-    logs ``precompact_empty`` and prints nothing. Anyone using that path against a
-    server loses their anchor at exactly the moment compaction discards the
-    transcript, with nothing erroring to say so.
-
-    This test caught the difference. It stays live because a mock makes the local
-    path look healthy while only the real server exposes the missing HTTP branch.
+    Every suite now builds the anchor over HTTP: the seed recall runs with an
+    empty query (there is no user question at compact time) and matches nothing,
+    so the hook falls back to the session detail endpoint, which returns the
+    recent QA and trace rows without one. Claude Code used to be the exception —
+    its pre-compact was local-SDK only, so in server mode it found nothing, logged
+    ``precompact_empty`` and printed no anchor at exactly the moment compaction
+    discarded the transcript. This test caught that; it stays live because a mock
+    makes a broken path look healthy while only a real server exposes it.
 
     ``has_precompact_http`` is still a flag rather than an assumption — a future
-    integration could arrive without the branch, and this would then say so.
+    integration could arrive without the fallback, and this would then say so
+    (as a strict xfail, so a suite that later gains it flips the flag instead of
+    quietly passing).
     """
     if not live_suite.has_precompact_http:
         request.node.add_marker(

@@ -302,19 +302,29 @@ Four things worth knowing, each of which would bite:
   tenant.
 - **The cloud backend needs no venv.** The hooks never import cognee; every call
   is stdlib HTTP to the configured server (`ensure_cognee_ready` is just a
-  `/health` check). That is why the cloud CI job has no cache step and a shorter
-  timeout.
-- **Cleanup is `DELETE /api/v1/datasets`**, the delete-everything route, run at both
-  ends of the session. Each test invents a `live_<uuid>` dataset; locally they die
-  with the temp HOME, on cloud they persist forever. Wiping on the way *in* covers
-  a previous run that was cancelled before teardown. It is session-scoped, not
-  per-test, because the final sync happens in a detached worker and deleting
-  between tests would race a write still in flight. A failed wipe warns loudly but
-  never fails the run — a red tier should mean the product broke.
-
-**The blunt delete route is only safe against a dedicated tenant that owns nothing
-else.** That precondition is the entire safety argument; do not point
-`COGNEE_LIVE_BASE_URL` at a tenant with real data.
+  `/health` check). That is why the cloud CI job has no cache step. It is *not*
+  faster overall, though: the graph round trips are the same and each cognify
+  runs on the shared tenant, so the job gets the same timeout as the local one.
+- **`GraphClient` takes the tenant key from `COGNEE_LIVE_API_KEY` on cloud.** The
+  plugin only writes `~/.cognee-plugin/api_key.json` when it *mints* a key, and
+  with `COGNEE_API_KEY` supplied it never does — so a client that read only the
+  cache was keyless on cloud, got 401 on every poll, and burned each assertion's
+  full deadline. A 401/403 now fails the assertion immediately; only 404 (dataset
+  not created yet) and 5xx (cognify still running) are retried.
+- **Cleanup is prefix-scoped**: `GET /api/v1/datasets`, keep the names starting
+  `live_`, `DELETE /api/v1/datasets/{id}` for each — never the delete-everything
+  route. Each test invents a `live_<uuid>` dataset; locally they die with the temp
+  HOME, on cloud they persist forever. Wiping on the way *in* covers a previous
+  run that was cancelled before teardown, and the CI job repeats the wipe in an
+  `if: cancelled() || failure()` step. It is session-scoped, not per-test, because
+  the final sync happens in a detached worker and deleting between tests would
+  race a write still in flight. A failed wipe warns loudly but never fails the
+  run — a red tier should mean the product broke.
+- **Failures print as they happen.** pytest normally holds every traceback until
+  the session ends; with ten-minute scenarios and a hard job timeout that left
+  nine cancelled nightly runs with `FAILED` lines and nothing else. The live
+  conftest's `pytest_runtest_makereport` wrapper emits each failure's traceback
+  and captured output (including the `live_artifacts` dump) immediately.
 
 Whole tier: **32 passed, 1 skipped, 3 xfailed in ~24m30s** (the skip is codex's
 counts segment; the xfails are the gaps below). Roughly 3x the single-suite time
