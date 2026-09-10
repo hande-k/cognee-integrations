@@ -9,6 +9,8 @@ Runs on the SessionStart hook. Responsibilities:
   5. Register the current Claude session as an active agent connection
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import os
@@ -101,11 +103,20 @@ _LAZY_BOOTSTRAP = os.environ.get("COGNEE_LAZY_BOOTSTRAP", "1").strip().lower() n
 # uv is kept self-contained under ~/.cognee-plugin so we never touch the user's
 # Python or PATH. A uv-managed Python guarantees a cognee-compatible runtime
 # (cognee requires 3.10-3.14) regardless of what's installed on the machine.
+# The hooks themselves need only a stdlib python3 of 3.9+ (see SDK-617): the
+# host interpreter never imports cognee, it only builds and talks to the venv.
 _UV_DIR = _GLOBAL_STATE_DIR / "uv"
 _UV_BIN = _UV_DIR / ("uv.exe" if os.name == "nt" else "uv")
 _UV_PYTHON_DIR = _GLOBAL_STATE_DIR / "python"
 _UV_INSTALL_URL = "https://astral.sh/uv/install.sh"
 _PINNED_PYTHON = os.environ.get("COGNEE_PLUGIN_PYTHON", "") or "3.12"
+# Floor for the HOST interpreter, enforced only on the uv-less fallback, which
+# builds the runtime venv from sys.executable and so inherits its version.
+_FALLBACK_VENV_MIN_PYTHON = (3, 10)
+# Written when that fallback is refused; read by the next SessionStart so the
+# refusal reaches the user as a systemMessage (the worker that hits it runs
+# detached, with nothing it prints visible). Cleared once a venv is ready.
+_HOST_PYTHON_MARKER = _GLOBAL_STATE_DIR / "host-python-unsupported.json"
 _PINNED_COGNEE_VERSION = "1.5.4"
 _INSTALL_TIMEOUT_SECONDS = float(os.environ.get("COGNEE_INSTALL_TIMEOUT", "") or 600.0)
 
@@ -172,6 +183,72 @@ def _find_uv() -> str:
         return str(_UV_BIN)
     found = shutil.which("uv")
     return found or ""
+
+
+def _host_python_label() -> str:
+    """``<sys.executable> (Python X.Y.Z)`` — names the interpreter a user must replace."""
+    return "{} (Python {}.{}.{})".format(sys.executable, *sys.version_info[:3])
+
+
+def _refuse_fallback_venv() -> None:
+    """Record why the uv-less fallback will not build the runtime venv.
+
+    Three readers: hook.log (forensics), this process's stderr (the bootstrap
+    log when detached, the terminal when not), and the marker the next
+    SessionStart turns into a systemMessage via ``_apply_host_python_warning``.
+    """
+    message = (
+        "Cognee Memory: cannot build the local Cognee runtime. uv is unavailable, and the "
+        "fallback would build the venv from {}, but that needs Python 3.10 or newer. Install "
+        "uv (https://docs.astral.sh/uv/) or a Python 3.10+ python3, then start a new "
+        "session.".format(_host_python_label())
+    )
+    detail = {
+        "python": sys.executable,
+        "version": "{}.{}.{}".format(*sys.version_info[:3]),
+        "required": "{}.{}".format(*_FALLBACK_VENV_MIN_PYTHON),
+    }
+    hook_log("host_python_too_old_for_venv", detail)
+    print(message, file=sys.stderr)
+    try:
+        _HOST_PYTHON_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        _HOST_PYTHON_MARKER.write_text(
+            json.dumps({"message": message, "updated_at": time.time(), **detail}),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        hook_log("host_python_marker_write_failed", {"error": str(exc)[:200]})
+
+
+def _apply_host_python_warning(output: dict) -> dict:
+    """Append the recorded fallback refusal (if any) to the hook's systemMessage.
+
+    The marker outlives the session that wrote it on purpose: every launch on
+    the broken host repeats the message until a venv is built (which clears it
+    in ``_write_venv_ready``) — this is the loud failure SDK-617 asks for.
+    """
+    try:
+        if not _HOST_PYTHON_MARKER.exists():
+            return output
+        message = str(
+            json.loads(_HOST_PYTHON_MARKER.read_text(encoding="utf-8")).get("message") or ""
+        )
+    except Exception as exc:
+        hook_log("host_python_marker_read_failed", {"error": str(exc)[:200]})
+        return output
+    if not message:
+        return output
+    result = dict(output or {})
+    hso = dict(result.get("hookSpecificOutput") or {})
+    hso.setdefault("hookEventName", "SessionStart")
+    existing = str(hso.get("systemMessage") or "").strip()
+    hso["systemMessage"] = "{}\n\n{}".format(existing, message) if existing else message
+    result["hookSpecificOutput"] = hso
+    # Also at the top level: that is where Claude Code documents the universal
+    # ``systemMessage`` field, and where the Antigravity adapter reads it.
+    top = str(result.get("systemMessage") or "").strip()
+    result["systemMessage"] = "{}\n\n{}".format(top, message) if top else message
+    return result
 
 
 def _install_uv() -> str:
@@ -290,6 +367,11 @@ def _write_venv_ready(version: str) -> None:
         os.replace(tmp, _VENV_READY_MARKER)
     except Exception as exc:
         hook_log("venv_ready_write_failed", {"error": str(exc)[:200]})
+    try:
+        # A usable venv exists, so the host-python refusal (if any) is moot.
+        _HOST_PYTHON_MARKER.unlink(missing_ok=True)
+    except Exception as exc:
+        hook_log("host_python_marker_unlink_failed", {"error": str(exc)[:200]})
 
 
 def ensure_cognee_installed(timeout: float = _INSTALL_TIMEOUT_SECONDS) -> bool:
@@ -421,8 +503,13 @@ def ensure_cognee_installed(timeout: float = _INSTALL_TIMEOUT_SECONDS) -> bool:
             except Exception as exc:
                 hook_log("cognee_install_failed", {"via": "uv", "error": str(exc)[:300]})
         elif not venv_present:
-            # Last-resort fallback: stdlib venv + pip. Slower, and relies on the
-            # system python3 being a cognee-compatible version (3.10-3.14).
+            # Last-resort fallback: stdlib venv + pip. Slower, and the venv inherits
+            # this interpreter, so the host python3 must itself satisfy cognee's
+            # floor (3.10-3.14). The hooks run on any 3.9+, so check explicitly
+            # rather than build a venv cognee could never install into.
+            if sys.version_info < _FALLBACK_VENV_MIN_PYTHON:
+                _refuse_fallback_venv()
+                return False
             try:
                 subprocess.run(
                     [sys.executable, "-m", "venv", str(_VENV_DIR)],
@@ -2066,6 +2153,7 @@ def main():
         hook_log("session_start_exception", {"error": str(exc)[:200]})
     output = _apply_memory_preference(output)
     output = _apply_update_nudge(output)
+    output = _apply_host_python_warning(output)
     print(json.dumps(output or {}))
 
 

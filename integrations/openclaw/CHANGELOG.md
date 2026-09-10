@@ -13,6 +13,21 @@ date-based (`YYYY.M.D`), matching the OpenClaw plugin ecosystem.
 
 ## [2026.9.8]
 
+### Fixed
+- **Hotfix: the uv-less install fallback refuses a host python older than 3.10
+  (SDK-617).** The bootstrap script (`~/.cognee-plugin/ensure_and_boot.py`) runs
+  under the system `python3` — `/usr/bin/python3`, which is 3.9.6 on macOS with
+  the Xcode Command Line Tools — and that is fine: it only needs the standard
+  library, and cognee runs in the uv-managed Python 3.12 venv it builds. But when
+  uv is unavailable and cannot be downloaded, the fallback `python3 -m venv`
+  inherits the host version, and a 3.9 venv can never hold cognee. The script
+  now refuses in that case and, since it daemonizes with its output closed,
+  records the reason in `~/.cognee-plugin/.venv-error.json`; the gateway's
+  "server did not become ready" warning quotes it (`readBootError`). The marker
+  is cleared once an install succeeds. README gains a Requirements section:
+  Python 3.9+ for the bootstrap, 3.10+ only for the uv-less fallback, none in
+  cloud mode. Shipped in place, without a version bump.
+
 ### Changed
 - **Per-prompt recall waits long enough for growing graphs.** `recallTimeoutMs`
   (per recall call) and `recallBudgetMs` (whole recall step) default to `10000` and

@@ -9,6 +9,8 @@ Configuration:
     Resolves session identity from Cognee endpoints via API auth.
 """
 
+from __future__ import annotations
+
 import asyncio
 import hashlib
 import json

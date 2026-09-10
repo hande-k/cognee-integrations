@@ -1,5 +1,7 @@
 """Elapsed-time bounds for read-only calls, without blocking interpreter exit."""
 
+from __future__ import annotations
+
 import math
 import queue
 import threading

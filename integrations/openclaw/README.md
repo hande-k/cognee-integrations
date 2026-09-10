@@ -56,6 +56,13 @@ Without this, any plugin found in your environment could be loaded automatically
 
 ## Installation
 
+### Requirements
+
+- Node.js, as required by your OpenClaw gateway.
+- **Python 3.9 or newer** as `python3` — only the standard library is used. On first use in local mode the plugin writes a small bootstrap script to `~/.cognee-plugin/` and runs it with the system `python3` (`/usr/bin/python3` on macOS, which is 3.9.6 with the Xcode Command Line Tools). That script fetches [uv](https://docs.astral.sh/uv/) and builds a Python 3.12 virtualenv for the Cognee server (reusing a 3.12 already on the machine, otherwise downloading a ~66 MB standalone build); cognee itself never runs under the system interpreter.
+- If uv is unavailable *and* cannot be downloaded, the bootstrap falls back to `python3 -m venv`, and that fallback needs **Python 3.10 or newer**. On an older host it refuses instead of building a venv cognee cannot install into, records the reason in `~/.cognee-plugin/.venv-error.json`, and the gateway log's "server did not become ready" warning quotes it.
+- Cloud mode (`COGNEE_BASE_URL` pointing at Cognee Cloud or a remote server) builds no runtime and has no Python requirement beyond running the bootstrap script.
+
 ### Published package
 
 ```bash

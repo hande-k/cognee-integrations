@@ -9,6 +9,8 @@ no network calls, no ``_plugin_common`` import.
 Output: ``cognee: <dataset-name> · local`` or ``cognee: <dataset-name> · cloud``
 """
 
+from __future__ import annotations
+
 import json
 import os
 import sys

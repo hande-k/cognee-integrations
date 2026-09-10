@@ -10,6 +10,23 @@ Default session dataset: `agent_sessions`. Default local server port: `8011`.
 
 Tests live in the shared Claude/Codex suite, Hermes `test_config_contract.py`, and OpenClaw unit tests. This replaces the obsolete config-file contract proposed in #169.
 
+## Python version requirements
+
+cognee itself requires Python 3.10 or newer (up to 3.14). What that means for each
+integration depends on whether it imports cognee in-process or only talks to a server:
+
+| Integration | Host Python floor | Why |
+|---|---|---|
+| Claude Code / Codex / Antigravity plugins | **3.9+** for the hooks; **3.10+** only for the uv-less fallback | Hooks are stdlib HTTP clients. In local mode they build a uv-managed **Python 3.12** venv for the Cognee server (fetching uv, and a ~66 MB standalone 3.12 when none is on the machine). Without uv the fallback builds the venv from the host `python3`, which then must be 3.10+; an older host is refused with `host_python_too_old_for_venv` in `hook.log` and a session-start message. |
+| OpenClaw | **3.9+** for the bootstrap script; **3.10+** only for the uv-less fallback | Same runtime scheme, driven from TypeScript. A refused fallback is recorded in `~/.cognee-plugin/.venv-error.json` and quoted in the gateway's "server did not become ready" warning. |
+| Hermes, LangGraph, CrewAI, Strands, Google ADK, Aider, Obsidian, chat-memory, Slack, Telegram, second-brain, web-widget | **3.10+** | `requires-python = ">=3.10"`; `pip`/`uv` refuse to install on 3.9. |
+| Dify, Dify SDK | **3.12+** | Dify plugin runtime requirement. |
+| Claude Agent SDK | **3.13+** | Follows `claude-agent-sdk`. |
+
+macOS's Xcode Command Line Tools install Python 3.9.6 as `/usr/bin/python3`. That is
+enough for the hook-based plugins and OpenClaw; for the SDK packages install a 3.10+
+interpreter (Homebrew, python.org or `uv python install 3.12`).
+
 ## Extraction models and authentication
 
 Cognee's backend configures extraction independently of the host assistant.

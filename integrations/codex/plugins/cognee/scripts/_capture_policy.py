@@ -1,5 +1,7 @@
 """Client-side automatic capture controls. Explicit remember is independent."""
 
+from __future__ import annotations
+
 import fnmatch
 import json
 import os

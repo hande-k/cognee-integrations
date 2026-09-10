@@ -1,5 +1,7 @@
 """Dataset UUIDs are authoritative; names are only for owned datasets."""
 
+from __future__ import annotations
+
 import json
 import os
 from uuid import UUID

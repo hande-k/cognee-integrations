@@ -12,6 +12,8 @@ Never modifies configuration, initialises databases, registers
 resources, writes files, or mutates state.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import pathlib

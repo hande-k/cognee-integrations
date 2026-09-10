@@ -1,5 +1,7 @@
 """Opt-in project tags and server-verified companion routing, pinned per session."""
 
+from __future__ import annotations
+
 import hashlib
 import os
 import re

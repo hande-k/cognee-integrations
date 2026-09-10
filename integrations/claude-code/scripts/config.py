@@ -26,6 +26,8 @@ Two modes, both over HTTP — the hooks never import cognee in-process:
   - Cloud: connect to a remote Cognee server via COGNEE_BASE_URL + COGNEE_API_KEY
 """
 
+from __future__ import annotations
+
 import json
 import os
 import subprocess

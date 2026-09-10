@@ -89,6 +89,15 @@ The Claude Code integration is a **plugin** — it gives Claude Code persistent 
 across sessions with no code to write. It auto-captures your prompts, tool traces, and
 responses, and auto-recalls relevant context on every prompt.
 
+**Requirements:** any Python 3.9+ as `python3` on PATH (the hooks are stdlib-only HTTP
+clients; macOS's Xcode Command Line Tools Python is enough). In local mode the plugin
+fetches [uv](https://docs.astral.sh/uv/) and builds its own Python 3.12 virtualenv for
+the Cognee server, so cognee's 3.10+ floor never applies to your system Python — except
+when uv is unavailable and cannot be downloaded, in which case the fallback needs a
+3.10+ `python3` and the plugin says so at session start. The SDK packages in the table
+above import cognee in-process and need Python 3.10+ (3.12+ for Dify, 3.13+ for the
+Claude Agent SDK); see [`integrations/CONFIGURATION.md`](integrations/CONFIGURATION.md#python-version-requirements).
+
 **1. Install the Claude Code plugin**
 
 Run these slash commands directly in the Claude Code chat:

@@ -116,6 +116,10 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `hook:final_sync_once_pruned` | `sync.sync_once_pruned` |
 | `hook:find_claude_parent_failed` | `find.claude_parent_failed` |
 | `hook:find_codex_parent_failed` | `find.codex_parent_failed` |
+| `hook:host_python_marker_read_failed` | `host_python.marker_read_failed` |
+| `hook:host_python_marker_unlink_failed` | `host_python.marker_unlink_failed` |
+| `hook:host_python_marker_write_failed` | `host_python.marker_write_failed` |
+| `hook:host_python_too_old_for_venv` | `host_python.too_old_for_venv` |
 | `hook:https_context_no_ca_bundle` | `https.context_no_ca_bundle` |
 | `hook:idle_watcher_kill_failed` | `idle.watcher_kill_failed` |
 | `hook:idle_watcher_restart_failed` | `idle.watcher_restart_failed` |

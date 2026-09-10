@@ -44,7 +44,7 @@ import { describeImprove, renderSessionLayerSections } from "./recall-layers.js"
 import { DigestTracker, formatFooter, sourceLabel } from "./digest.js";
 import { cogneeSessionId, datasetNameForScope, isMultiScopeEnabled, normalizeAgentId, routeFileToScope } from "./scope.js";
 import { syncFiles, syncFilesScoped } from "./sync.js";
-import { bootServerIfNeeded, waitForServerHealth, isLocalUrl, resolveOrMintApiKey, spawnExitWatcher, exitWatcherPidfilePath } from "./server.js";
+import { bootServerIfNeeded, waitForServerHealth, isLocalUrl, readBootError, resolveOrMintApiKey, spawnExitWatcher, exitWatcherPidfilePath } from "./server.js";
 
 /** Expand a leading `~` in a workspace path to the user's home directory. */
 function expandHome(p: string | undefined): string | undefined {
@@ -1218,7 +1218,14 @@ const memoryCogneePlugin = {
           // can legitimately take several minutes.
           await waitForServerHealth(cfg.baseUrl, 600_000);
         } catch (e) {
-          logger.warn?.(`cognee-openclaw: server did not become ready: ${String(e)}`);
+          // The boot script daemonizes with its output closed; when its install
+          // step failed (e.g. no uv and a host python3 older than 3.10) the only
+          // trace is the marker it leaves, so surface that alongside the timeout.
+          const reason = await readBootError();
+          logger.warn?.(
+            `cognee-openclaw: server did not become ready: ${String(e)}` +
+              (reason ? ` — boot script reported: ${reason}` : ""),
+          );
           return;
         }
       }
